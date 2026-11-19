@@ -47,13 +47,11 @@ batch.
 and 1,024 tokens both pay one read of about 40 GB. That is why a short prompt shows 4.3 tok/s and a 1,024-token prompt
 would show about 64 tok/s for the same wall time.
 
-**A 16 GB Air cannot hold two expert caches.** `--expert-cache 3700` (3,921 slots, 6.39 GiB) is the *host* code's
-cache. The Metal window does not read it: it streams the same experts from the `.experts` file into its own arena, and
-every request's report says `GPU 0 hits this request`. With the flag set the process held 8.1 GB before the arena and
-`arena_budget` allowed only 1.0–3.2 GB, while the arena's floor is 3.4 GB (a prompt chunk's layer needs 576 slots in
-each of three size classes); the arena was forced over the budget and a 3,575-token prompt then failed on its second
-chunk. Without the flag the same machine has that memory for the window's arena. `--mmap-experts` stays on (it maps the
-file; it does not copy 47 GB into RAM).
+**A 16 GB Air's expert tier is about 4 GB, not 10.** The window holds 8.13 GB before the arena (5.08 GB of Metal buffers — 2.84 dense, 0.68 the hyper-connections, 0.88 the drafter — plus host memory) and the GPU working set is 12.7 GB, so `arena_budget` can give the arena at most about 4 GB (12.7 − 8.1 − 0.5). The experts themselves are 47 GB, so a 4 GB arena holds about 9 % of them; that is why the exit report shows a 30 % hit rate and 1.6 GB read per window.
+
+`--expert-cache` is not part of that number: the host code's device copies are given back at the first request (9.94 GB `given back (unused by the Metal window)`, its 3,921 slots included), which is also why every request's report says `GPU 0 hits this request`. Leaving the flag off only skips a 21 s, 6.87 GB startup fill.
+
+What the arena actually gets depends on `STRATA_METAL_KEEP_FREE_GB` and the memory free at the first request. With 4.6 GB free and 3.5 GB kept the budget was 1.0 GB, under the arena's floor (3.4 GB: a prompt chunk's layer needs 576 slots in each of three size classes), the arena was forced over the budget, and a 3,575-token prompt then failed on its second chunk. With the default 7 GB kept the plan is smaller and the fill refuses earlier — the safer setting on 16 GB. Same prompt, 2,833 tokens read in 47.2 s (60.1 tok/s) when macOS had 7.6 GB free.
 
 ## Eight changes so far
 
@@ -69,7 +67,7 @@ and 8 are the configuration that made the measured step possible.
 | 5 | `gr_norm` folded into the mixer GEMVs and the MoE combine (`hcf.metal`) | M3 | **off**, `STRATA_METAL_HCF=1` | `fuse_parity`: bo, R′, xn bitwise, 1–8 tokens | −10.9 % on the HC read, measured on an M5 Max UD-Q4_K_XL (from `hcf.metal`); not measured here |
 | 6 | The sampler rides in the window's command buffer | M4 | on | Same kernels, same buffers, same order | One command buffer fewer a window (<1 ms, static) |
 | 7 | The prompt chunk yields to the live arena (halves in 128-row steps) | M6 | on, shrink only | Did not trigger at 3.37 GB (1.60 GB of buffers is under half) | A large chunk's buffers cannot evict the arena it is trying to use |
-| 8 | The tuned configuration: 32K context, `--mmap-experts`, no `--expert-cache` (the window's arena is the only expert cache), budget 1,024 | — | `run-iq3_xxs-tuned.sh` | The runs above | The numbers above; with the host cache on, 6.4 GiB competed with the arena |
+| 8 | The tuned configuration: 32K context, `--mmap-experts`, `STRATA_METAL_KEEP_FREE_GB` 7 (the default), no `--expert-cache` (its slots are given back at the first request anyway; off skips a 21 s fill), budget 1,024 | — | `run-iq3_xxs-tuned.sh` | The runs above | The numbers above |
 
 ## Setup
 
