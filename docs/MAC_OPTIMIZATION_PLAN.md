@@ -150,6 +150,15 @@ The target pack is IQ3_XXS: quality over minimum size. That changes the arithmet
 | Profile preload | 1,490 experts at 2.17 GB/s in one run; 0 in a later run that had 7.0 GB free at planning |
 | Prompt | 69 tokens in 16.0 s: one pass over about 40 GB of experts at 2.5 GB/s |
 | Drafts | 736 of 1,149 (64 %) at 3.5 tok/s; 413 of 747 (55 %) at 3.4 tok/s |
+| Arena 4.00 GB (`STRATA_METAL_ARENA_GB=4`, keep 3.5) | 2,133 slots, filled in 1.9 s at 1.94 GB/s, footprint 12.6 GB of the 12.7 GB cap; 64 tokens in 16.6 s (3.9 tok/s, drafts 36 of 51) on a fresh process |
+| Ceiling, no expert reads (`STRATA_METAL_STREAM_FAKE=1`, wrong answers) | 73-74 ms a decode step (13.5 tok/s), 2,512 prompt tokens in 19.4 s (129.8 tok/s) |
+
+The fake-mode number is the floor for one step: with wrong routing the drafter proposes nothing, so each request is a
+one-token window. It says the expert reads are about three quarters of a decode step (74 ms against 259-283 ms a token),
+which is why a bigger arena is the lever and a kernel change here is not. It also fixes the frame: 40 GiB of experts in a
+12.7 GB working set cannot happen, on this Mac or with any arrangement of the rest — the KV is 12 full-attention layers
+of 512 K and 512 V values a cell, under 1 GB at 32,896 cells even at 2 bytes a value (arithmetic from `geo.h`'s shape,
+not a logged size), and the dense weights are 2.84 GB.
 
 The live readout is a two-second window (`serve/server.py:313`), so it is not a build comparison; the request totals
 are. The four kernel and scheduling changes are inside the noise here: one dispatch less a layer is about 0.25 ms of a

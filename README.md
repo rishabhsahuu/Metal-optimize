@@ -51,6 +51,15 @@ would show about 64 tok/s for the same wall time.
 
 `--expert-cache` is not part of that number: the host code's device copies are given back at the first request (9.94 GB `given back (unused by the Metal window)`, its 3,921 slots included), which is also why every request's report says `GPU 0 hits this request`. Leaving the flag off only skips a 21 s, 6.87 GB startup fill.
 
+**What the SSD costs, and the ceiling.** Timing only, with `STRATA_METAL_STREAM_FAKE=1` (every miss is pointed at slot 0, so
+nothing is read and the answers are wrong), the same engine on the same Air took **73–74 ms for a decode step**
+(13.5 tok/s) once the arena was warm, and **19.4 s for a 2,512-token prompt** (129.8 tok/s). The real engine at a
+4.00 GB arena (2,133 slots preloaded in 1.9 s, footprint 12.6 GB of the 12.7 GB cap) took 16.6 s for 64 tokens
+(3.9 tok/s, drafts 36 of 51) and 47.2 s for 2,833 prompt tokens (60.1 tok/s) at 3.58 GB. So the expert reads are about
+three quarters of a decode step: even with every expert resident this Air would not pass about 13 tok/s, and it cannot
+hold the 40 GiB of experts that would need. The fake-mode step is one token (the drafter proposes nothing on its
+garbage hidden states), so it is a floor for one step, not a whole-request average.
+
 What the arena actually gets depends on `STRATA_METAL_KEEP_FREE_GB` and the memory free at the first request. With 4.6 GB free and 3.5 GB kept the budget was 1.0 GB, under the arena's floor (3.4 GB: a prompt chunk's layer needs 576 slots in each of three size classes), the arena was forced over the budget, and a 3,575-token prompt then failed on its second chunk. With the default 7 GB kept the plan is smaller and the fill refuses earlier — the safer setting on 16 GB. Same prompt, 2,833 tokens read in 47.2 s (60.1 tok/s) when macOS had 7.6 GB free.
 
 ## Eight changes so far
