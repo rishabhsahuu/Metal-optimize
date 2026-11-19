@@ -135,6 +135,7 @@ constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
+struct HcfArgs { uint32_t n_embd, hc; float eps; uint32_t pad; };   // hcf.metal
 struct MoeArgs {
     uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
     uint32_t gu_row, d_row, n_embd, n_ff, n_tok, topk, n_expert, gx_gu, gx_dn, pad;
@@ -143,6 +144,12 @@ struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane;
 struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
 struct ArgArgs { uint32_t n_vocab, parts; };
+// M3: the formats hcf.metal instantiates gemvh_ for (its list; F16 and the trellis types are not among them)
+inline bool hcf_kind(int ty) {
+    return ty == ref::F32 || ty == ref::BF16 || ty == ref::Q8_0 || ty == ref::Q4_0 || ty == ref::Q5_0 || ty == ref::IQ4_NL ||
+           ty == ref::IQ4_XS || ty == ref::Q2_0 || ty == ref::IQ3_S || ty == ref::Q3_K || ty == ref::Q4_K || ty == ref::Q5_K ||
+           ty == ref::Q6_K;
+}
 // the routed gate/up's i-quant grids from constant memory (QUANT_CTAB, function constant 23 of quant.metal): bitwise
 // the threadgroup copy's values, 3-7% faster on the M5 Max; STRATA_METAL_CTAB=0 turns it off
 bool metal_ctab() {
@@ -350,7 +357,10 @@ private:
     void gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const Act& x, const mtl::Buffer& y, size_t y_stride,
               int ntok, size_t y_off = 0, const mtl::Buffer* wb = nullptr);
     void xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const Act& out, int n);
-    void gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_, int ntok);
+    void gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_, int ntok,
+                 bool folded = false);   // folded: hcf's producer already applied bo_ and wrote xn_
+    void gemv_hcf(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const Act& x, const mtl::Buffer& y, int n_out, int ntok,
+                  const std::string& npre);
     void layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0);
     void ple_cpu(int T);
     // the MTP layer: the input branches + attention HC read + K/V append for `n` rows (srcR rows, host tokens) at
@@ -435,7 +445,7 @@ private:
     int64_t n_vocab_ = 0;
     float eps_ = 1e-6f;
     // buffers
-    mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, rcnt_, h_, ye_, gsh_, ush_,
+    mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, rcnt_, hcnt_, h_, ye_, gsh_, ush_,
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
         emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_;
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
@@ -493,6 +503,11 @@ private:
     const char* k_norm() const { return ldb_ ? "gr_norm2" : "gr_norm"; }
     const char* k_comb() const { return ldb_ ? "moe_combine_sh2" : "moe_combine_sh"; }
     bool fuse_ = !(std::getenv("STRATA_METAL_FUSE") && std::string(std::getenv("STRATA_METAL_FUSE")) == "0");
+    // M3, opt-in (STRATA_METAL_HCF=1): the producer of bo applies it to R and forms the next read's xn itself
+    // (hcf.metal's gemv_hcf / moe_combine_hcf), saving gr_norm's dispatch per HC read.  The tile is (32,1,8,2), the
+    // one the engine picks for these 6144-wide mixers; fuse_parity checks the kernels bitwise.
+    bool hcf_ = std::getenv("STRATA_METAL_HCF") && std::string(std::getenv("STRATA_METAL_HCF")) == "1";
+    bool hc_folded_ = false;   // the last combine folded the apply the next HC read would do
     bool qdirty_ = false;
     // STRATA_METAL_KPROF=T (test tooling): once, after the 20th cached window of T tokens with the head, the GPU time
     // of each kernel class alone (the window's own dispatches of that pipeline + weight role, run by themselves)
@@ -776,8 +791,9 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     R_ = A(4 * MAXT * HC * N); bo_ = A(4 * MAXT * N); inj_[0] = A(4 * MAXT * HC); inj_[1] = A(4 * MAXT * HC);
     xn_ = A(4 * MAXT * HC * N); lo_ = A(4 * MAXT * LR); qkv_ = A(4 * MAXT * G_CONV); z_ = A(4 * MAXT * G_ZV);
     al_ = A(4 * MAXT * G_HV); be_ = A(4 * MAXT * G_HV); yg_ = A(4 * MAXT * G_ZV); logits_ = A(4 * MAXT * 512);
-    ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); rcnt_ = A(16); h_ = A(4 * MAXT * TOPK * NFF);
+    ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); rcnt_ = A(16); hcnt_ = A(16); h_ = A(4 * MAXT * TOPK * NFF);
     std::memset(rcnt_.ptr, 0, 16);   // router_route's last-arrival counter (it stores 0 when it is done)
+    std::memset(hcnt_.ptr, 0, 16);   // gemv_hcf / moe_combine_hcf's (idem)
     ye_ = A(4 * MAXT * TOPK * N); gsh_ = A(4 * MAXT * NFF); ush_ = A(4 * MAXT * NFF); ysh_ = A(4 * MAXT * N);
     sg_ = A(4 * MAXT * 4); qfull_ = A(4 * MAXT * G_QFULL); kcur_ = A(4 * MAXT * G_KV); vcur_ = A(4 * MAXT * G_KV);
     iqr_ = A(4 * MAXT * G_IQR); ikr_ = A(4 * MAXT * G_ID); qcur_ = A(4 * MAXT * G_QOUT); qidx_ = A(4 * MAXT * G_IH * G_ID);
@@ -1003,7 +1019,7 @@ void Window::xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const A
 
 // the hyper-connection read (gr.metal, 3 dispatches): the previous sublayer's write folded in when `apply`
 void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_,
-                     int ntok) {
+                     int ntok, bool folded) {
     const gguf::Tensor& tn = T(pre + "_norm.weight");
     const gguf::Tensor& tdn = T(pre + "_down.weight");
     const gguf::Tensor& tup = T(pre + "_up.weight");
@@ -1016,7 +1032,7 @@ void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, boo
     d1.grid[0] = HC;
     d1.grid[1] = ntok;
     d1.tg[0] = 256;
-    push(ds, d1);
+    if (!folded) push(ds, d1);   // M3: hcf's producer did this line and wrote xn_ (cur_inj_ still turns below)
     // each matrix: its load-time Q8_0 copy (q8off_), else the file's own tensor (Unsloth's are Q8_0 already, their
     // inject rows F32)
     auto src = [&](const gguf::Tensor& t) -> std::pair<const mtl::Buffer*, size_t> {
@@ -1050,6 +1066,27 @@ void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, boo
     cur_inj_ = 1 - cur_inj_;
 }
 
+// M3 (STRATA_METAL_HCF=1): the mixer's output GEMV with gr_norm folded in.  hcf.metal's gemv_hcf writes y as gemv
+// does, applies the value to R (the line gr_norm would), and its last threadgroup forms xn from the whole R.  The
+// tile is (32,1,8,2) - the one Window::gemv picks for n_in >= 6144, which is what both 6144-wide mixers have.
+void Window::gemv_hcf(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const Act& x, const mtl::Buffer& y, int n_out,
+                      int ntok, const std::string& npre) {
+    const int ty = t.type;
+    const gguf::Tensor& wn = T(npre + "_norm.weight");
+    const std::string fn = "gemvh_" + std::to_string(ty);
+    GemvArgs a{(uint32_t) N, (uint32_t) n_out, (uint32_t) ntok, (uint32_t) ref::row_bytes(t.type, N), (uint32_t) N, (uint32_t) n_out};
+    HcfArgs h{(uint32_t) N, (uint32_t) HC, eps_, 0};
+    mtl::Dispatch d;
+    d.p = P(lib_, fn, mtl::Constants().i(0, ntok), fn + "#" + std::to_string(ntok));
+    d.args = {mtl::Arg::B(W_, t.offset), mtl::Arg::B(x.b, x.plane_bytes() * xkind(ty)), mtl::Arg::B(x.b, x.plane_bytes() * 4),
+              mtl::Arg::B(y), mtl::Arg::V(a), mtl::Arg::B(R_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, wn.offset),
+              mtl::Arg::B(xn_), mtl::Arg::B(hcnt_), mtl::Arg::V(h)};
+    const int rpt = (8 / 2) * (32 / 32) * 1;   // (SG/KS) * (32/LPR) * NR of the 32,1,8,2 tile: 4 rows a threadgroup
+    d.grid[0] = (uint32_t) ((n_out + rpt - 1) / rpt);
+    d.tg[0] = 256;
+    push(ds, d);
+}
+
 namespace {
 struct HadArgs { uint32_t width, x_stride, y_stride; float scale; uint32_t has_signs, pad; };   // quant.metal
 }
@@ -1081,8 +1118,17 @@ void Window::had_rows_ind(std::vector<mtl::Dispatch>& ds, int lib, const std::st
 
 void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0) {
     const std::string b = "blk." + std::to_string(l) + ".";
+    // M3: the mixer whose bo this layer's HC reads consume.  hcf folds the apply into it only where the engine's tile
+    // is already the one gemvh_ mirrors (n_in >= 6144 -> 32,1,8,2), and never for batch rows, fp16, or Gyro's tiles.
+    const gguf::Tensor& tmo = T(b + (l % G_QI != G_QI - 1 ? "ssm_out.weight" : "attn_output.weight"));
+    static const bool nr2 = [] {
+        const char* e = std::getenv("STRATA_METAL_GEMV_NR");
+        return e && std::atoi(e) == 2;   // Window::gemv's 2-row tile, not the (32,1,8,2) gemvh_ mirrors
+    }();
+    const bool hcf_mix = hcf_ && !rows_ && !f16_enc_ && !gyro_dense_ && !nr2 && tmo.shape[0] >= 6144 && hcf_kind(tmo.type);
     // ---- the mixer: layer 1's read after the PLE is not applied again (its pending write was applied before it)
-    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok);
+    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok, hc_folded_);
+    hc_folded_ = false;
     if (l % G_QI != G_QI - 1) {
         const int gi = l - l / G_QI;
         // a one-token window commits in the step; a longer one leaves the state and commit() folds the kept prefix
@@ -1152,7 +1198,8 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         push(ds, d);
         (void) self_commit;   // the history ping-pong turns after the window (run) or at commit
         if (!fuse_) xprep(ds, yg_, XY_, G_ZV);
-        gemv(ds, T(b + "ssm_out.weight"), XY_, bo_, N, ntok);
+        if (hcf_mix) gemv_hcf(ds, tmo, XY_, bo_, N, ntok, b + "hc_ffn");
+        else gemv(ds, tmo, XY_, bo_, N, ntok);
         }
     } else {
         const int qi = l / G_QI;
@@ -1235,10 +1282,11 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         m.tg[0] = 256;
         push(ds, m);
         if (rec_) rec_->push_back({(int) ds.size() - 1, 1});
-        gemv(ds, T(b + "attn_output.weight"), XQ_, bo_, N, ntok);
+        if (hcf_mix) gemv_hcf(ds, tmo, XQ_, bo_, N, ntok, b + "hc_ffn");
+        else gemv(ds, tmo, XQ_, bo_, N, ntok);
     }
     // ---- the MoE
-    gr_read(ds, b + "hc_ffn", true, XF_, false, ntok);
+    gr_read(ds, b + "hc_ffn", true, XF_, false, ntok, hcf_mix);
     const gguf::Tensor& trt = T(b + "ffn_gate_inp.weight");
     // M2: router_route (router.metal) is the router GEMV and moe_route in one dispatch, bitwise against the pair
     // (metal/tests/fuse_parity.cpp).  It is issued at moe_route's place below, once the tile arguments are known;
@@ -1384,12 +1432,25 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     }
     {
         GlueArgs a{N, (uint32_t) ntok, N, TOPK};
+        // M3: layer 0's write is applied by the PLE block, not by a read, so it is never folded there
+        const bool hcf_comb = hcf_ && !rows_ && l > 0;
         mtl::Dispatch d;
-        d.p = P(lib_, k_comb(), {}, k_comb());
-        d.args = {mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::B(bo_), mtl::Arg::V(a)};
+        if (hcf_comb) {
+            const std::string npre = l + 1 < G_NL ? "blk." + std::to_string(l + 1) + ".hc_attn" : "output_hc";
+            const gguf::Tensor& wn = T(npre + "_norm.weight");
+            HcfArgs h{(uint32_t) N, (uint32_t) HC, eps_, 0};
+            d.p = P(lib_, "moe_combine_hcf", {}, "moe_combine_hcf");
+            d.args = {mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::B(bo_), mtl::Arg::V(a),
+                      mtl::Arg::B(R_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, wn.offset), mtl::Arg::B(xn_), mtl::Arg::B(hcnt_),
+                      mtl::Arg::V(h)};
+        } else {
+            d.p = P(lib_, k_comb(), {}, k_comb());
+            d.args = {mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::B(ysh_), mtl::Arg::B(sg_), mtl::Arg::B(bo_), mtl::Arg::V(a)};
+        }
         d.grid[0] = (ntok * N + 255) / 256;
         d.tg[0] = 256;
         push(ds, d);
+        hc_folded_ = hcf_comb;   // the next HC read skips its gr_norm
     }
     if (taps_on_ && tap_slot_[l] >= 0) tap_dispatch(ds, l, R_, bo_, inj_[cur_inj_], tap_dec_, ntok);   // DFlash2: the layers completed output (dflash2.inc)
 }
@@ -1584,7 +1645,8 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     }
     for (int l = 1; l < G_NL; ++l) layer(ds, l, Tn, pos0);
     // ---- the final mixer and the head
-    gr_read(ds, "output_hc", true, XA_, true, Tn);
+    gr_read(ds, "output_hc", true, XA_, true, Tn, hc_folded_);
+    hc_folded_ = false;
     if (head) gemv(ds, T("output.weight"), XA_, lm_, (size_t) n_vocab_, Tn);
     if (head) {
         ArgArgs a{(uint32_t) n_vocab_, 120};

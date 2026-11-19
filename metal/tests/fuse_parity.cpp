@@ -20,13 +20,14 @@ struct MoeArgs {
 };
 constexpr int P_INTS = 16 + 128 + 128 + 4 + 128 * 3, P_TOKENT = 16 + 128 + 128 + 4 + 128 * 2;
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
+struct HcfArgs { uint32_t n_embd, hc; float eps; uint32_t pad; };
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
 }  // namespace
 
 int main() {
     mtl::Context cx;
     const int lib = cx.compile({"quant.metal", "units.metal", "moe.metal", "gemv.metal", "router.metal", "gr.metal",
-                                "gr2.metal", "glue.metal"});
+                                "gr2.metal", "glue.metal", "hcf.metal"});
     std::printf("device %s\n", cx.device_name().c_str());
     int fails = 0;
     const int N = 2560, NO = 48, MAXT = 8;
@@ -153,6 +154,103 @@ int main() {
             const bool ok = std::memcmp(R1.ptr, R2.ptr, 4 * (size_t)nt * HC * N) == 0 && std::memcmp(x1.ptr, x2.ptr, 4 * (size_t)nt * HC * N) == 0;
             fails += !ok;
             std::printf("gr_norm_comb ntok %d: R', xn bitwise %s\n", nt, ok ? "PASS" : "FAIL");
+        }
+    }
+    // ---- hcf (hcf.metal): the producer writes bo, applies it to R and its last threadgroup forms xn, bitwise
+    //      gemv + gr_norm and moe_combine_sh + gr_norm
+    {
+        const int HC = 4, TOPK = 10;
+        const size_t rbh = ref::row_bytes(ref::BF16, N);
+        const size_t R0b = 4 * (size_t) MAXT * HC * N;
+        mtl::Buffer Wh = cx.alloc(rbh * N), R0 = cx.alloc(R0b), R1 = cx.alloc(R0b), R2 = cx.alloc(R0b),
+                    boh1 = cx.alloc(4 * MAXT * N), boh2 = cx.alloc(4 * MAXT * N), inj = cx.alloc(4 * MAXT * HC),
+                    wn = cx.alloc(4 * HC * N), xn1 = cx.alloc(R0b), xn2 = cx.alloc(R0b), cnt = cx.alloc(16),
+                    yer = cx.alloc(4 * (size_t) MAXT * TOPK * N), yshr = cx.alloc(4 * MAXT * N), sgv = cx.alloc(4 * MAXT),
+                    plr = cx.alloc(4 * P_INTS);
+        ref::random_blocks(ref::BF16, Wh.as<uint8_t>(), N, N, 11, 0.05f);
+        for (size_t i = 0; i < R0b / 4; ++i) R0.as<float>()[i] = r.sym();
+        for (int i = 0; i < MAXT * HC; ++i) inj.as<float>()[i] = r.sym() * 3;
+        for (int i = 0; i < HC * N; ++i) wn.as<float>()[i] = 0.5f + r.uni();
+        for (size_t i = 0; i < yer.bytes / 4; ++i) yer.as<float>()[i] = r.sym();
+        for (size_t i = 0; i < yshr.bytes / 4; ++i) yshr.as<float>()[i] = r.sym();
+        for (int i = 0; i < MAXT; ++i) sgv.as<float>()[i] = r.sym() * 3;
+        for (int i = 0; i < MAXT * TOPK; ++i) plr.as<int>()[P_TOKENT + i] = (i * 7) % (MAXT * TOPK);
+        mtl::Pipeline pcm = cx.pipeline(lib, "moe_combine_sh"), pcm_h = cx.pipeline(lib, "moe_combine_hcf"),
+                      pn = cx.pipeline(lib, "gr_norm");
+        for (int nt = 1; nt <= MAXT; ++nt) {
+            mtl::Pipeline pgv = cx.pipeline(lib, "gemv_30_32_1_8_2", mtl::Constants().i(0, nt)),
+                          pgv_h = cx.pipeline(lib, "gemvh_30", mtl::Constants().i(0, nt));   // NTOK, as the engine sets it
+            const size_t s16 = (size_t) 4 * 4 * MAXT * N;
+            GemvArgs ga{(uint32_t) N, (uint32_t) N, (uint32_t) nt, (uint32_t) rbh, (uint32_t) N, (uint32_t) N};
+            GrArgs gr{(uint32_t) N, HC, 320, (uint32_t) nt, 1, 1e-6f};
+            HcfArgs hc{(uint32_t) N, HC, 1e-6f, 0};
+            // gemv + gr_norm  ==  gemvh
+            std::memcpy(R1.ptr, R0.ptr, R0b);
+            std::memcpy(R2.ptr, R0.ptr, R0b);
+            mtl::Dispatch g;
+            g.p = &pgv;
+            g.args = {mtl::Arg::B(Wh), mtl::Arg::B(xp), mtl::Arg::B(xp, s16), mtl::Arg::B(boh1), mtl::Arg::V(ga)};
+            g.grid[0] = N / 4;
+            g.tg[0] = 256;
+            mtl::Dispatch n1;
+            n1.p = &pn;
+            n1.args = {mtl::Arg::B(R1), mtl::Arg::B(boh1), mtl::Arg::B(inj), mtl::Arg::B(wn), mtl::Arg::B(xn1), mtl::Arg::V(gr)};
+            n1.grid[0] = HC;
+            n1.grid[1] = nt;
+            n1.tg[0] = 256;
+            cx.run({g, n1});
+            std::memset(cnt.ptr, 0, 16);
+            mtl::Dispatch g2;
+            g2.p = &pgv_h;
+            g2.args = {mtl::Arg::B(Wh), mtl::Arg::B(xp), mtl::Arg::B(xp, s16), mtl::Arg::B(boh2), mtl::Arg::V(ga),
+                       mtl::Arg::B(R2), mtl::Arg::B(inj), mtl::Arg::B(wn), mtl::Arg::B(xn2), mtl::Arg::B(cnt), mtl::Arg::V(hc)};
+            g2.grid[0] = N / 4;
+            g2.tg[0] = 256;
+            cx.run({g2});
+            const bool b_ok = std::memcmp(boh1.ptr, boh2.ptr, 4 * (size_t) nt * N) == 0,
+                       r_ok = std::memcmp(R1.ptr, R2.ptr, 4 * (size_t) nt * HC * N) == 0,
+                       x_ok = std::memcmp(xn1.ptr, xn2.ptr, 4 * (size_t) nt * HC * N) == 0;
+            bool ok = b_ok && r_ok && x_ok;
+            if (!ok) {
+                std::printf("  gemvh ntok %d: bo %d R %d xn %d\n", nt, (int) b_ok, (int) r_ok, (int) x_ok);
+                for (int q = 0; q < nt * HC * N; ++q)
+                    if (R1.as<float>()[q] != R2.as<float>()[q]) {
+                        std::printf("    R first diff q %d (t %d c %d d %d): %.9g vs %.9g\n", q, q / (HC * N), (q / N) % HC, q % N,
+                                    R1.as<float>()[q], R2.as<float>()[q]);
+                        break;
+                    }
+            }
+            // moe_combine_sh + gr_norm  ==  moe_combine_hcf
+            std::memcpy(R1.ptr, R0.ptr, R0b);
+            std::memcpy(R2.ptr, R0.ptr, R0b);
+            GlueArgs cg{(uint32_t) N, (uint32_t) nt, (uint32_t) N, TOPK};
+            mtl::Dispatch c;
+            c.p = &pcm;
+            c.args = {mtl::Arg::B(yer), mtl::Arg::B(plr), mtl::Arg::B(yshr), mtl::Arg::B(sgv), mtl::Arg::B(boh1), mtl::Arg::V(cg)};
+            c.grid[0] = (uint32_t) ((nt * N + 255) / 256);
+            c.tg[0] = 256;
+            mtl::Dispatch n2;
+            n2.p = &pn;
+            n2.args = {mtl::Arg::B(R1), mtl::Arg::B(boh1), mtl::Arg::B(inj), mtl::Arg::B(wn), mtl::Arg::B(xn1), mtl::Arg::V(gr)};
+            n2.grid[0] = HC;
+            n2.grid[1] = nt;
+            n2.tg[0] = 256;
+            cx.run({c, n2});
+            std::memset(cnt.ptr, 0, 16);
+            mtl::Dispatch c2;
+            c2.p = &pcm_h;
+            c2.args = {mtl::Arg::B(yer), mtl::Arg::B(plr), mtl::Arg::B(yshr), mtl::Arg::B(sgv), mtl::Arg::B(boh2), mtl::Arg::V(cg),
+                       mtl::Arg::B(R2), mtl::Arg::B(inj), mtl::Arg::B(wn), mtl::Arg::B(xn2), mtl::Arg::B(cnt), mtl::Arg::V(hc)};
+            c2.grid[0] = (uint32_t) ((nt * N + 255) / 256);
+            c2.tg[0] = 256;
+            cx.run({c2});
+            const bool b2 = std::memcmp(boh1.ptr, boh2.ptr, 4 * (size_t) nt * N) == 0,
+                       r2 = std::memcmp(R1.ptr, R2.ptr, 4 * (size_t) nt * HC * N) == 0,
+                       x2 = std::memcmp(xn1.ptr, xn2.ptr, 4 * (size_t) nt * HC * N) == 0;
+            ok = ok && b2 && r2 && x2;
+            if (!(b2 && r2 && x2)) std::printf("  combine ntok %d: bo %d R %d xn %d\n", nt, (int) b2, (int) r2, (int) x2);
+            fails += !ok;
+            std::printf("hcf gemvh / moe_combine_hcf ntok %d: bo, R', xn bitwise %s\n", nt, ok ? "PASS" : "FAIL");
         }
     }
     std::printf("%s\n", fails ? "SOME FAILED" : "ALL PASS");

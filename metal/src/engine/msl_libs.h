@@ -24,7 +24,7 @@ inline const char* kNoGgmlCommon = "#define NO_GGML_COMMON 1\n";
 
 // the decode window
 inline MslLib lib_core(bool f16, const std::string& kq) {
-    return {{"quant.metal", "units.metal", "moe.metal", "gemv.metal", "router.metal", "gr.metal", "gr2.metal", "glue.metal"},
+    return {{"quant.metal", "units.metal", "moe.metal", "gemv.metal", "router.metal", "gr.metal", "gr2.metal", "glue.metal", "hcf.metal"},
             geo::prelude() + (f16 ? std::string("#define STRATA_METAL_F16 1\n") : std::string()) + kq};
 }
 inline MslLib lib_gdn() { return {{"gdn.metal"}, kNoGgmlCommon}; }
