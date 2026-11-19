@@ -129,9 +129,10 @@ The numbers are starting points copied from the CUDA defaults and Basalt's page,
 
 ## What to measure
 
-Two Macs: this MacBook Air M4 16 GB, and a 32 GB M4 Mac mini (`docs/MAC.md`'s streaming fixture). One pack on the Air,
-Q2_0 (the only one whose download nearly fits 68 GB of free disk), with the arena pinned with `STRATA_METAL_ARENA_GB` so
-the arms are comparable. On the mini, the same pack, and IQ3_XXS where it fits.
+Two Macs: this MacBook Air M4 16 GB, and a 32 GB M4 Mac mini (`docs/MAC.md`'s streaming fixture). IQ3_XXS on both, with
+the arena pinned with `STRATA_METAL_ARENA_GB` so the arms are comparable. IQ3_XXS needs about 55 GB of memory to stay
+resident, so it streams on both; on the Air its download (75.8 GB with the n-gram table) needs about 15 GB of disk freed
+first.
 
 - **Arms:** A = today (static profile, LRU); B = A + learned profile from A's own run; C = B + heat victims; D = C + rounds.
 - **Metrics:** decode tok/s (short question, story, code, JSON); prompt tok/s at 4K and 16K; the `at_layer` hit rate and

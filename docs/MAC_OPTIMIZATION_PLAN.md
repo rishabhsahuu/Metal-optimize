@@ -48,7 +48,13 @@ numerics). "Output" says whether tokens can change.
 
 | ID | Change | Files | Evidence it pays | Effort | Output |
 | --- | --- | --- | --- | --- | --- |
-| M1 | Turn on the fp16 decode windows for **streamed** packs | `window.cpp` `f16_auto_for` (`:167-173`) | The function returns false when streaming, so a streamed Mac never gets it unless forced. Forced on an M1 Max: a 2-token window 56-60 -> 40-41 ms, mean KL 0.009 against fp32 | small | Yes (fp16 math), so opt-in first, then a measured default |
+| M1 | Turn on the fp16 decode windows for **streamed** packs | `window.cpp` `f16_auto_for` (`:167-173`), `:1271` | The function returns false when streaming, so a streamed Mac never gets it unless forced. Forced on an M1 Max: a 2-token window 56-60 -> 40-41 ms, mean KL 0.009 against fp32. **On a streamed pack only the dense GEMVs change**: the expert path's fp16 arm needs `!stream_` and Q2_0 (`:1271`) | small | Yes (fp16 math), so opt-in first, then a measured default |
+
+**For an IQ3_XXS Air, read the table in a different order.** IQ3_XXS expert layers cost about twice Q2_0's (333 vs
+166 us on the M4), so the streaming path, not the dense kernels, is where this pack's time goes. That promotes M9 (the
+handshake), M7 and M8 (placement) ahead of M1, which on this pack can only touch the dense side. The rest of P0 stays:
+they are bitwise, cheap and independent of the pack.
+
 | M2 | Wire `router_route` and `gemv_cat` into the engine | `router.metal`, `gemv.metal`, `window.cpp` | Both exist and are bitwise-checked against the two-dispatch form in `metal/tests/fuse_parity.cpp`; today only `token_chain` uses them | small | No |
 | M3 | Compile `hcf.metal` and fold `gr_norm` into its producers | `msl_libs.h` (`lib_core`), `hcf.metal` | Not compiled at all today; `hcf.metal:9-12` claims bitwise and its comment records -10.9 % on the HC read (*static*) | small | No |
 | M4 | Append sampling to the window's command buffer | `window.cpp:3433` | A whole `run_graph` per window for two small dispatches; greedy already reduces in-graph (`argmax_part`) | small | No |
@@ -56,7 +62,7 @@ numerics). "Output" says whether tokens can change.
 | M6 | Size the prompt chunk from the arena, not from RAM | `window.cpp:2911-2919` | Today `phys >= 96 GB ? 4096 : 1024`. Basalt bisects the largest chunk whose expert slots fit the cache (+128); our own curve is still rising at 4,096 | small | No |
 
 M1 is the single largest cheap win: it is a condition change, not a kernel, and the fallback is one environment variable.
-It needs a quality gate first (100-chunk KLD and the 61-task suite on a streamed Q2_0 or IQ3_XXS), because the KL cost
+It needs a quality gate first (100-chunk KLD and the 61-task suite on a streamed IQ3_XXS), because the KL cost
 was 0.009 on the M1 Max. Gyro trellis packs have no fp16 decode (`x16_kind` returns -1 for the TQ types), so they are
 unaffected and must be tested for no regression.
 
@@ -103,20 +109,37 @@ One line each, all verified in Basalt's own docs and code:
 The reversal to watch: Metal *does* expose int8 matrix operations through MetalPerformancePrimitives, which Basalt's
 CUDA-only view does not see. That is M15, and it is a prefill question, not a decode one.
 
-## On a 16 GB MacBook Air
+## On a 16 GB MacBook Air, with IQ3_XXS
 
-- The model does not fit: Q2_0 is a 37.6 GB file plus a 28.8 GB n-gram table, about 66 GB to download, against ~68 GB
-  of free disk on this machine, and ~46 GB to stay resident. It streams, with an arena of about 5 GB.
-- The items that can move it: **M1** (dense time), **M9** (the 48 handshakes a token), **M7/M8** (which experts wait),
-  then M2-M5 as a few percent each. M6 does nothing here: the chunk stays at its floor. M13/M14 need several users.
-- None of it makes the model fit. The honest framing for a 16 GB Air is "less slow", not "fast".
-- A fanless Air throttles. Every number must be taken twice, cold and after a few minutes, or it will flatter whichever
-  build ran first.
+The target pack is IQ3_XXS: quality over minimum size. That changes the arithmetic in three places.
+
+- **Disk comes first.** IQ3_XXS is a 47.0 GB file plus the 28.8 GB n-gram table: 75.8 GB to download, plus about 6 GB
+  of working space (`REPACK_WORK_GB` in `strata_control/mac_fit.py`). That is ~82 GB, against 68 GB free on this
+  machine. Free roughly 15 GB before starting or the install stops part-way.
+- **It streams.** Resident needs about 55 GB (`model_need_gb`), against Metal's ~12.9 GB share of 16 GB. The arena lands
+  near 5 GB, so most experts are always cold. The engine's own rule recommends Q2_0 at this size
+  (`recommend_model`), so IQ3_XXS has to be chosen explicitly; the choice is kept with a warning (`docs/MAC.md`).
+- **What it costs.** Measured on a 32 GB M4 with an 11.5-14.7 GB arena: 10.0 tok/s on a short question, 9.2 on a
+  story, 7.7 after a 6K document, 65.8 tok/s on a 4K prompt. A 5.7-9.3 GB arena cost Q2_0 about 40 % of its decode
+  (14.1 -> 8.3), so expect roughly 5-6 tok/s here before throttling. That is an extrapolation, not a measurement.
+- **Per expert it is twice the work of Q2_0**: one expert layer takes 333 us against 166 us on the M4. The streaming
+  path dominates, which is why M9, M7 and M8 come first for this pack.
+- **No draft layer.** A streamed Mac below 96 GB runs without MTP (`stream_mtp`), and its 1.2 GB is worth more as
+  arena.
+- **Context.** The default is 32K, but every KV cell competes with the arena. 8-16K is the sane setting here; 36,864
+  tokens costs 0.65 GB a sequence (`docs/MAC.md`).
+- **What to expect in use.** 5-6 tok/s is roughly 200-270 words a minute, about reading speed. Usable for chat, slow
+  for an agent that writes long files.
+
+None of this makes the model fit. The honest framing for a 16 GB Air is "less slow", not "fast", and a fanless Air
+throttles: every number must be taken twice, cold and after a few minutes, or it will flatter whichever build ran first.
 
 ## How to measure
 
 Fixtures: this MacBook Air M4 16 GB, and a 32 GB M4 Mac mini (the engine's own streaming fixture, so the numbers line up
-with [MAC.md](MAC.md)). One pack per machine; the arena pinned with `STRATA_METAL_ARENA_GB` so arms are comparable.
+with [MAC.md](MAC.md)). IQ3_XXS on both, for the reason above; the arena pinned with `STRATA_METAL_ARENA_GB` so arms are
+comparable. The mini's marks to beat: 10.0 tok/s short question, 9.2 story, 7.7 after a 6K document, 65.8 tok/s on a 4K
+prompt.
 
 - **Arms:** one change at a time against the branch point. Never two.
 - **Metrics:** decode tok/s on a short question, a story, code and JSON; prompt tok/s at 4K and 16K; `at_layer` hit rate
@@ -129,18 +152,25 @@ with [MAC.md](MAC.md)). One pack per machine; the arena pinned with `STRATA_META
 
 ## First three commits
 
-1. `metal: fp16 decode windows for streamed packs (opt-in, measured)` — M1, behind `STRATA_METAL_F16=1`, with the KL and
-   task-suite gate and a benchmark table in the message.
-2. `metal: router_route and gemv_cat in the decode window (bitwise)` — M2, checked with `metal/tests/fuse_parity.cpp`.
-3. `metal: hcf in lib_core, norm folded into its producer (bitwise)` — M3.
+1. `metal: router_route and gemv_cat in the decode window (bitwise)` — M2, checked with `metal/tests/fuse_parity.cpp`.
+   No quality gate needed, so it is the safe place to start.
+2. `metal: hcf in lib_core, norm folded into its producer (bitwise)` — M3.
+3. `metal: learned expert profile for the streaming arena (opt-in)` — M7, measured on IQ3_XXS on the mini and the Air,
+   with the arena size recorded.
+
+M1 is a separate experiment, not a first commit: on a streamed IQ3_XXS it can only touch the dense GEMVs, and its effect
+on this pack is unmeasured. Run it behind `STRATA_METAL_F16=1` with a 100-chunk KLD gate and the 61-task suite before it
+is considered for a default.
 
 Each one keeps the default path byte-identical until its measurement says otherwise, per `CONTRIBUTING.md`.
 
 ## Open questions
 
-- Does fp16 decode help a 5 GB arena as much as the M1 Max's 64-slot one? Unmeasured.
+- Does fp16 decode help a 5 GB arena as much as the M1 Max's 64-slot one, and does it reach an IQ3_XXS pack's dense
+  tensors at all? Only Q3_K-Q6_K, IQ4_XS and Q2_0 take the fp16 GEMV (`x16_kind`); the routed experts never do when
+  streaming. Unmeasured.
 - How much does the Air throttle over a 10-minute run, and does that hide kernel wins? Unmeasured.
 - Is `stubs_gyro.cpp`'s "trellis unsupported" comment stale against the working path in `window.cpp:1252`? Worth
   confirming with the maintainer before touching the Gyro kernels.
-- Q2_0 or Gyro-S on this Air: 66 GB and 58.5 GB of download respectively, against 68 GB free. Neither leaves room for
-  the experts' copy, which is the +17 % decode item in [MAC.md](MAC.md).
+- IQ3_XXS needs ~82 GB of free disk (75.8 GB of download plus working space) against 68 GB here, and the 40 GB experts'
+  copy, the +17 % decode item in [MAC.md](MAC.md), does not fit beside it at all.
