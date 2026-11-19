@@ -51,6 +51,8 @@ would show about 64 tok/s for the same wall time.
 
 `--expert-cache` is not part of that number: the host code's device copies are given back at the first request (9.94 GB `given back (unused by the Metal window)`, its 3,921 slots included), which is also why every request's report says `GPU 0 hits this request`. Leaving the flag off only skips a 21 s, 6.87 GB startup fill.
 
+**The dense weights can come from the shard instead of a copy.** `STRATA_METAL_DENSE_FILE=1` wraps the dense tensors' own pages of the GGUF as the Metal buffer (no copy: 292 runs, 2.84 GB of clean file pages) and leaves the 40 GiB of routed experts out of the wrap. On this Air the process then holds 5.41 GB instead of 8.11 GB, and the room left under the footprint cap rises from 4.1 GB to 6.9 GB. The arena does not grow by that much, because the same 2.84 GB still occupies RAM: hot file pages are not free memory, and `arena_avail` does not count them. The measured arena went from 3.27 GB (1,742 slots) to 3.56 GB (1,894 slots), +9 %. The wrapped path returned the same text as the copy path for two greedy prompts (24 tokens each); one 64-token request at the 3.56 GB arena took 20.7 s (3.1 tok/s, drafts 34 of 62), inside the run-to-run spread. The first attempt wrapped the whole 47 GB shard, and the first window's submit never returned: the driver makes the buffers a window binds resident, and a 9.5 GB chunk carries the experts the arena is streaming. Only the dense runs are wrapped now.
+
 **What the SSD costs, and the ceiling.** Timing only, with `STRATA_METAL_STREAM_FAKE=1` (every miss is pointed at slot 0, so
 nothing is read and the answers are wrong), the same engine on the same Air took **73–74 ms for a decode step**
 (13.5 tok/s) once the arena was warm, and **19.4 s for a 2,512-token prompt** (129.8 tok/s). The real engine at a
@@ -62,10 +64,10 @@ garbage hidden states), so it is a floor for one step, not a whole-request avera
 
 What the arena actually gets depends on `STRATA_METAL_KEEP_FREE_GB` and the memory free at the first request. With 4.6 GB free and 3.5 GB kept the budget was 1.0 GB, under the arena's floor (3.4 GB: a prompt chunk's layer needs 576 slots in each of three size classes), the arena was forced over the budget, and a 3,575-token prompt then failed on its second chunk. With the default 7 GB kept the plan is smaller and the fill refuses earlier — the safer setting on 16 GB. Same prompt, 2,833 tokens read in 47.2 s (60.1 tok/s) when macOS had 7.6 GB free.
 
-## Eight changes so far
+## Nine changes so far
 
 Six of the sixteen items in [the plan](docs/MAC_OPTIMIZATION_PLAN.md) are implemented (M2, M3, M4, M6, M7, M8). Rows 3
-and 8 are the configuration that made the measured step possible.
+and 8 are the configuration that made the measured step possible; row 9 is a memory experiment, off by default.
 
 | # | Change | Plan item | Default | Evidence | Effect |
 | --- | --- | --- | --- | --- | --- |
@@ -77,6 +79,7 @@ and 8 are the configuration that made the measured step possible.
 | 6 | The sampler rides in the window's command buffer | M4 | on | Same kernels, same buffers, same order | One command buffer fewer a window (<1 ms, static) |
 | 7 | The prompt chunk yields to the live arena (halves in 128-row steps) | M6 | on, shrink only | Did not trigger at 3.37 GB (1.60 GB of buffers is under half) | A large chunk's buffers cannot evict the arena it is trying to use |
 | 8 | The tuned configuration: 32K context, `--mmap-experts`, `STRATA_METAL_KEEP_FREE_GB` 7 (the default), no `--expert-cache` (its slots are given back at the first request anyway; off skips a 21 s fill), budget 1,024 | — | `run-iq3_xxs-tuned.sh` | The runs above | The numbers above |
+| 9 | The dense weights wrapped from the shard instead of copied into Metal memory | — | **off**, `STRATA_METAL_DENSE_FILE=1` | The same two greedy prompts as the copy path returned the same text; 292 runs, 2.84 GB of file pages | Anonymous footprint 8.11 → 5.41 GB; arena 3.27 → 3.56 GB (+9 % slots); no speed change measured |
 
 ## Setup
 
@@ -139,6 +142,7 @@ All are off unless set. The defaults are the tuned path above.
 | `STRATA_METAL_HCF=1` | Fold `gr_norm` into the mixers and the MoE combine (M3) |
 | `STRATA_METAL_PROMPT_CHUNK=N` | Pin the prompt chunk in rows; the default is automatic and yields to the arena (M6) |
 | `STRATA_METAL_ARENA_GB=N` | Set the arena size explicitly |
+| `STRATA_METAL_DENSE_FILE=1` | Streaming: wrap the dense tensors' pages of the shard instead of a 2.84 GB copy. Smaller anonymous footprint (8.11 → 5.41 GB here); the arena grew 3.27 → 3.56 GB on this Air, not by the whole copy, because the pages still occupy RAM |
 
 ## What is not here
 

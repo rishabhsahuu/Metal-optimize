@@ -398,6 +398,66 @@ private:
         g -= b; u -= b; d -= b;
         return (size_t) b;
     }
+    // the chunks of a model bigger than one Metal buffer overlap by the largest range bound at one offset: a tensor, or a
+    // layer's routed experts (gate, up and down, bound together at the first of them: moe_rebase)
+    size_t shard_span() const {
+        size_t span = 0;
+        // (not the n-gram table: the host reads it from the SSD, the GPU never binds it - in a Gyro file it is 28.8 GB of the one file)
+        for (const auto& kv : f_.tensors)
+            if (kv.first != "per_layer_token_embd.weight") span = std::max<size_t>(span, kv.second.bytes);
+        for (int l = 0; l < G_NL; ++l) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            const gguf::Tensor *g = f_.find(b + "ffn_gate_exps.weight"), *u = f_.find(b + "ffn_up_exps.weight"),
+                               *d = f_.find(b + "ffn_down_exps.weight");
+            if (!g || !u || !d) continue;
+            const uint64_t lo = std::min({g->offset, u->offset, d->offset});
+            const uint64_t hi = std::max({g->offset + g->bytes, u->offset + u->bytes, d->offset + d->bytes});
+            span = std::max<size_t>(span, hi - lo);
+        }
+        return span;
+    }
+    // STRATA_METAL_DENSE_FILE: the runs of the shard that hold the dense tensors, merged when close (the same layer's
+    // weights) so one buffer covers several.  Not the routed experts (the arena streams those) and not the n-gram table
+    // (the host reads it; in a Gyro file it is 28.8 GB of the one file): a buffer that holds them would be made resident
+    // in full for every window, which the 16 GB Air cannot do.
+    std::vector<std::pair<uint64_t, uint64_t>> dense_runs(const std::vector<std::string>& skip) const {
+        std::vector<std::pair<uint64_t, uint64_t>> rs;   // [offset, end)
+        for (const auto& kv : f_.tensors) {
+            const gguf::Tensor& t = kv.second;
+            if (t.name.find("_exps") != std::string::npos) continue;
+            if (t.name == "per_layer_token_embd.weight") continue;
+            if (t.bytes > ((size_t) 1 << 30)) continue;   // (larger than any bound dense tensor: a Gyro n-gram table)
+            if (std::find(skip.begin(), skip.end(), t.name) != skip.end()) continue;   // (the Q8_0 HC copies are used)
+            rs.emplace_back(t.offset, t.offset + t.bytes);
+        }
+        std::sort(rs.begin(), rs.end());
+        std::vector<std::pair<uint64_t, uint64_t>> out;
+        const uint64_t gap = (uint64_t) 1 << 20, maxrun = (uint64_t) 256 << 20;
+        for (const auto& r : rs) {
+            if (!out.empty() && r.first <= out.back().second + gap && r.second - out.back().first <= maxrun)
+                out.back().second = std::max(out.back().second, r.second);
+            else
+                out.push_back(r);
+        }
+        for (auto& r : out) r.second -= r.first;   // [start, end) here; the callers take (start, length)
+        return out;
+    }
+    // STRATA_METAL_DENSE_FILE: the dense tensors are read on every step, so their pages must be hot when the first window
+    // runs.  Asked for at startup, and faulted in here once: the GPU's first window cannot wait for a page that is not in.
+    // Returns the bytes.
+    uint64_t warm_dense_pages(const std::vector<std::pair<uint64_t, uint64_t>>& runs) const {
+        const size_t page = 16384;
+        uint64_t bytes = 0;
+        volatile uint8_t sink = 0;
+        for (const auto& r : runs) {
+            const uint64_t off = r.first, len = r.second;
+            const uint64_t lo = off / page * page, hi = (off + len + page - 1) / page * page;
+            madvise((uint8_t*) f_.map + lo, (size_t) (hi - lo), MADV_WILLNEED);
+            for (uint64_t o = lo; o < hi; o += page) sink = (uint8_t) (sink ^ ((const uint8_t*) f_.map)[o]);
+            bytes += hi - lo;
+        }
+        return bytes;
+    }
     int lib_ = -1, lgdn_ = -1, lqsa_ = -1, lsmp_ = -1, lple_ = -1;
     bool samp_on_ = false;
     strata::kernels::SamplerParams samp_;
@@ -755,22 +815,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
                 if (hi < f_.map_bytes) madvise((uint8_t*) f_.map + hi, f_.map_bytes - hi, MADV_WILLNEED);
             }
         }
-        // the chunks of a model bigger than one Metal buffer overlap by the largest range bound at one offset: a tensor,
-        // or a layer's routed experts (gate, up and down, bound together at the first of them: moe_rebase)
-        size_t span = 0;
-        // (not the n-gram table: the host reads it from the SSD, the GPU never binds it - in a Gyro file it is 28.8 GB of the one file)
-        for (const auto& kv : f_.tensors)
-            if (kv.first != "per_layer_token_embd.weight") span = std::max<size_t>(span, kv.second.bytes);
-        for (int l = 0; l < G_NL; ++l) {
-            const std::string b = "blk." + std::to_string(l) + ".";
-            const gguf::Tensor *g = f_.find(b + "ffn_gate_exps.weight"), *u = f_.find(b + "ffn_up_exps.weight"),
-                               *d = f_.find(b + "ffn_down_exps.weight");
-            if (!g || !u || !d) continue;
-            const uint64_t lo = std::min({g->offset, u->offset, d->offset});
-            const uint64_t hi = std::max({g->offset + g->bytes, u->offset + u->bytes, d->offset + d->bytes});
-            span = std::max<size_t>(span, hi - lo);
-        }
-        W_ = cx_->wrap(f_.map, f_.map_bytes, span);
+        W_ = cx_->wrap(f_.map, f_.map_bytes, shard_span());
         if (W_.handle == nullptr) { err = "metal window: cannot wrap " + shard1 + " as a Metal buffer"; return false; }
     }
     n_vocab_ = (int64_t) T("output.weight").shape[1];
@@ -932,7 +977,19 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         std::vector<std::string> skip;   // the BF16 originals of the Q8_0 HC copies are not read again
         if (hc_q8_)
             for (const auto& kv : q8off_) skip.push_back(kv.first);
-        if (!st_->load_dense(f_, *cx_, skip, W_, err)) return false;
+        // STRATA_METAL_DENSE_FILE=1: the shard's own pages are the dense weights, so the 2.84 GB copy is not made.  They
+        // are clean file cache (macOS drops them, never compresses them) and do not count in the process's footprint;
+        // the pages still occupy RAM, so the arena's gain is what macOS counts as available, not the whole 2.84 GB.
+        const char* df = std::getenv("STRATA_METAL_DENSE_FILE");
+        const bool dense_file = df && *df && std::string(df) != "0";
+        if (dense_file) {
+            const auto runs = dense_runs(skip);
+            const uint64_t pages = warm_dense_pages(runs);
+            W_ = cx_->wrap_ranges(f_.map, runs);
+            if (W_.handle == nullptr) { err = "metal window: cannot wrap " + shard1 + " as a Metal buffer"; return false; }
+            std::fprintf(stderr, "strata metal stream: dense weights wrapped from the shard, no copy (%.2f GB of file-backed pages, "
+                                 "%.2f GB allocated in all)\n", pages / 1e9, cx_->allocated() / 1e9);
+        } else if (!st_->load_dense(f_, *cx_, skip, W_, err)) return false;
         const char* e = std::getenv("STRATA_METAL_PREFETCH");
         st_pred_ = !(e && std::atoi(e) <= 0);
         if (st_pred_) predL_ = A(4 * (size_t) G_NL * MAXT * 512);
@@ -1775,6 +1832,9 @@ bool Window::stream_arena(std::string& err) {
                              "Metal window)\n", g / 1e9);
     }
     const double used = (double) cx_->allocated();
+    if (const uint64_t fb = cx_->file_backed())
+        std::fprintf(stderr, "strata metal stream: %.2f GB of the weights are file-backed pages (clean file cache, not in the "
+                             "arena's budget)\n", fb / 1e9);
     // what macOS gives now without paging anything out (arena_avail: free, purgeable, the clean file cache; not other
     // programs' inactive memory, freed only by compressing or swapping it)
     auto avail_now = [&]() -> double {

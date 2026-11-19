@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mtl {
@@ -22,6 +23,10 @@ struct Buffer {
     // a buffer longer than maxBufferLength: overlapping chunks every `stride` bytes (see Context::wrap)
     std::shared_ptr<std::vector<void*>> chunks;
     size_t stride = 0;
+    // a sparse view of a shard (see Context::wrap_ranges): one buffer per run that is ever bound, sorted by off.  Only
+    // these runs take part in the bindings; the shard's other pages (the routed experts) are never made resident.
+    struct Run { uint64_t off = 0; size_t len = 0; void* handle = nullptr; };
+    std::shared_ptr<std::vector<Run>> runs;
     size_t bias = 0;          // bytes from the MTLBuffer's start to ptr (a view onto an allocation the runtime owns)
     template <class T> T* as() const { return static_cast<T*>(ptr); }
 };
@@ -94,6 +99,9 @@ public:
     Pipeline pipeline_uncached(int lib, const std::string& fn, const Constants& c);
     size_t zc_count() const;
     uint64_t allocated() const { return allocated_; }   // bytes of alloc() + wrap() buffers so far
+    // wrap_ranges()'s bytes: pages of a read-only file mapping.  They are clean file cache (macOS drops them, never
+    // compresses them), so arena_budget.h must not treat them as anonymous memory the engine holds.
+    uint64_t file_backed() const { return file_bytes_; }
 
     // Compiles a library from MSL source files (paths), prepended by `prelude` (defines) and, if include_ggml,
     // ggml-common.h with GGML_COMMON_DECL_METAL/IMPL_METAL.  Returns a library id (index); aborts with the
@@ -109,6 +117,9 @@ public:
     // the same, also when bytes > maxBufferLength: then overlapping chunks, each holding any range of up to
     // max_span bytes that starts in it (max_span = the largest tensor bound at one offset)
     Buffer wrap(void* page_aligned, size_t bytes, size_t max_span);
+    // a no-copy view of runs [off, off + len) of `base` (page-aligned, each <= maxBufferLength): only those pages ever
+    // take part in a binding, so a shard's 40 GiB of routed experts is never made resident for the dense weights
+    Buffer wrap_ranges(void* base, const std::vector<std::pair<uint64_t, uint64_t>>& runs);
     void free(Buffer& b);
 
     // Encodes `ds` into ONE compute encoder (serial or concurrent dispatch type) and ONE command buffer, `reps`
@@ -148,6 +159,7 @@ private:
     struct Impl;
     Impl* impl_;
     uint64_t allocated_ = 0;
+    uint64_t file_bytes_ = 0;
 };
 
 double now_s();                                  // monotonic wall clock (seconds)

@@ -22,6 +22,7 @@ static void check(bool ok, const std::string& what) {
 }
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // a hang must still show the last check that ran
     double factor = 1.6;
     for (int i = 1; i + 1 < argc; ++i)
         if (!std::strcmp(argv[i], "--factor")) factor = std::atof(argv[i + 1]);
@@ -82,6 +83,36 @@ int main(int argc, char** argv) {
         }
     }
     check(bad_enc == 0, "encode(): " + std::to_string(starts.size()) + " offsets, both ends of each range read right");
+    // wrap_ranges: a sparse view (the dense tensors of a streaming shard).  Only the runs become buffers; a bind at any
+    // offset inside a run reads the mapping's bytes there, and the gaps between the runs are never bound.
+    {
+        std::vector<std::pair<uint64_t, uint64_t>> runs;
+        const uint64_t run = (uint64_t) 128 << 20;
+        for (int i = 0; i < 3; ++i) runs.emplace_back((uint64_t) i * ((uint64_t) 1 << 30) + pg, run);
+        mtl::Buffer R = cx.wrap_ranges(map, runs);
+        check((bool) R.runs && R.runs->size() == runs.size(),
+              "wrap_ranges: " + std::to_string(R.runs ? R.runs->size() : 0) + " runs");
+        int bad = 0;
+        for (const auto& r : runs)
+            for (uint64_t off : {r.first, r.first + ((uint64_t) 64 << 20)}) {
+                auto* f = reinterpret_cast<float*>(static_cast<uint8_t*>(map) + off);
+                for (uint32_t i = 0; i < n; ++i) {
+                    f[i] = (float) (off / pg) * 10.0f + (float) i;
+                    f[far + i] = -(float) (off / pg) - 0.25f * (float) i;
+                }
+                std::memset(dst.ptr, 0, dst.bytes);
+                mtl::Dispatch d;
+                d.p = &pipe;
+                d.args = {mtl::Arg::B(R, off), mtl::Arg::B(dst), mtl::Arg::B(par)};
+                d.grid[0] = n / 64; d.tg[0] = 64;
+                cx.run({d});
+                const float* o = dst.as<float>();
+                for (uint32_t i = 0; i < n; ++i)
+                    bad += o[i] != (float) (off / pg) * 10.0f + (float) i || o[n + i] != -(float) (off / pg) - 0.25f * (float) i;
+            }
+        check(bad == 0, "wrap_ranges: both ends of every run read right");
+        cx.free(R);
+    }
     // run_icb is a bench path (rt_bench only; the engine encodes with run/run_graph).  On the M4 it reads wrong at some
     // offsets of a single buffer too (--factor 0.9, no PR code involved), so it is reported, not counted.
     std::printf("note run_icb(): %d of %zu offsets read wrong%s\n", bad_icb, starts.size(), split ? "" : " (single buffer)");

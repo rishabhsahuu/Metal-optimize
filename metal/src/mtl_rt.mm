@@ -66,6 +66,18 @@ struct Context::Impl {
 static inline id<MTLBuffer> B(const Buffer& b) { return (__bridge id<MTLBuffer>)b.handle; }
 // the MTLBuffer and offset that bind byte `off` of b (a chunked buffer: the chunk the offset selects)
 static inline id<MTLBuffer> BO(const Buffer& b, size_t off, size_t& o) {
+    if (b.runs) {   // a sparse view: the run that holds off (the last one that starts at or before it)
+        const auto& r = *b.runs;
+        size_t lo = 0, hi = r.size();
+        while (lo < hi) {
+            const size_t m = lo + (hi - lo) / 2;
+            if (r[m].off <= (uint64_t) off) lo = m + 1;
+            else hi = m;
+        }
+        const size_t k = lo == 0 ? 0 : lo - 1;
+        o = off - (size_t) r[k].off;
+        return (__bridge id<MTLBuffer>) r[k].handle;
+    }
     if (!b.chunks) { o = off + b.bias; return B(b); }   // (bias: a view onto part of a bigger allocation; 0 otherwise)
     const size_t k = std::min(off / b.stride, b.chunks->size() - 1);
     o = off - k * b.stride;
@@ -639,6 +651,37 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
     return r;
 }
 
+// A sparse wrap: one no-copy buffer per run of the shard that is ever bound, so nothing else of it is in a binding.
+// The bytes are clean file pages, not anonymous memory: they move out of allocated_ and into file_bytes_, so the arena's
+// budget (engine/arena_budget.h) does not count them as memory the engine holds.
+// The whole-shard wrap (wrap) cannot be used while the model streams: the driver makes the buffers a command buffer
+// binds resident, and a 9.5 GB chunk carries the routed experts the arena is streaming - the first window's submit
+// never returned (60 s, on the 16 GB Air, 2.85 GB of dense weights and 40 GiB of experts in one 47 GB shard).
+Buffer Context::wrap_ranges(void* base, const std::vector<std::pair<uint64_t, uint64_t>>& runs) {
+    const size_t pg = 16384;
+    Buffer r;
+    r.runs = std::make_shared<std::vector<Buffer::Run>>();
+    r.ptr = base;
+    uint64_t end = 0, tot = 0;
+    for (const auto& [off, len] : runs) {
+        const uint64_t lo = off / pg * pg, hi = (off + len + pg - 1) / pg * pg;
+        id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:(uint8_t*) base + lo length:(size_t) (hi - lo)
+                                                        options:MTLResourceStorageModeShared deallocator:nil];
+        if (!b) {
+            std::fprintf(stderr, "mtl: wrap range %llu+%llu failed\n", (unsigned long long) lo, (unsigned long long) (hi - lo));
+            std::exit(4);
+        }
+        r.runs->push_back({lo, (size_t) (hi - lo), (__bridge_retained void*) b});
+        end = hi > end ? hi : end;
+        tot += hi - lo;
+    }
+    r.bytes = (size_t) end;
+    r.handle = r.runs->empty() ? nullptr : r.runs->front().handle;
+    file_bytes_ += tot;
+    std::fprintf(stderr, "mtl: wrapped %zu runs of the shard (%.2f GB of file pages, no copy)\n", r.runs->size(), tot / 1e9);
+    return r;
+}
+
 #if defined(STRATA_DS4_RUNTIME)
 // The runtime's own MTLBuffer under a CPU address (strata::gpu's allocations), when [p, p + bytes) lies inside one.  Binding it
 // - the same MTLBuffer, so the same GPU address, as every other kernel that touches this memory - instead of a fresh no-copy
@@ -702,6 +745,11 @@ void Context::free(Buffer& b) {
     std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
     const bool hold = impl_->cb_def != nil || impl_->inflight != nil;
 #endif
+    if (b.runs) {
+        for (auto& x : *b.runs) { id<MTLBuffer> m = (__bridge_transfer id<MTLBuffer>) x.handle; m = nil; }
+        b = Buffer{};
+        return;
+    }
     if (b.chunks) {
 #if defined(STRATA_DS4_RUNTIME)
         for (void* h : *b.chunks) {

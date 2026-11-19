@@ -152,6 +152,17 @@ The target pack is IQ3_XXS: quality over minimum size. That changes the arithmet
 | Drafts | 736 of 1,149 (64 %) at 3.5 tok/s; 413 of 747 (55 %) at 3.4 tok/s |
 | Arena 4.00 GB (`STRATA_METAL_ARENA_GB=4`, keep 3.5) | 2,133 slots, filled in 1.9 s at 1.94 GB/s, footprint 12.6 GB of the 12.7 GB cap; 64 tokens in 16.6 s (3.9 tok/s, drafts 36 of 51) on a fresh process |
 | Ceiling, no expert reads (`STRATA_METAL_STREAM_FAKE=1`, wrong answers) | 73-74 ms a decode step (13.5 tok/s), 2,512 prompt tokens in 19.4 s (129.8 tok/s) |
+| Dense weights copied (`load_dense`, the default) | 789 tensors, 2.84 GB in 3.4 s; 5.08 GB allocated, process 8.11 GB, 7.3 GB available; arena 3.27 GB, 1,742 slots; two greedy prompts (24 tokens, `tools/bitwise_probe.py`) returned "The ocean is a vast, ... 70% of the " and "Red, Blue, Green" |
+| Dense weights wrapped from the shard (`STRATA_METAL_DENSE_FILE=1`) | 292 runs, 2.84 GB of file pages; 2.25 GB allocated, process 5.41 GB, 7.6 GB available; arena 3.56 GB, 1,894 slots; the same two prompts returned the same text; 64 tokens in 20.7 s (3.1 tok/s, drafts 34 of 62) |
+
+The dense-file arm is a memory result, not a speed one: the 2.84 GB left the anonymous footprint (8.11 -> 5.41 GB) but
+stayed in RAM as clean file pages, and `arena_avail` does not count hot file pages as free, so the arena grew 9 % (3.27
+-> 3.56 GB), not by the whole copy. The attempt to wrap the whole 47 GB shard instead of its dense runs (2026-11-19,
+same Air) hung the first window's GPU submit: `IOGPUCommandQueueSubmitCommandBuffers` never returned, the serve layer's
+60 s stall report fired, and the GPU stayed wedged for later processes (a trivial Metal copy hung too; a reboot clears
+it). That is why `wrap_ranges` exists and only the runs bound by a window are wrapped. The `wrap_split_test` case for
+`wrap_ranges` was added after that and has not been run yet: run
+`./build-metal/wrap_split_test` after a reboot.
 
 The fake-mode number is the floor for one step: with wrong routing the drafter proposes nothing, so each request is a
 one-token window. It says the expert reads are about three quarters of a decode step (74 ms against 259-283 ms a token),
