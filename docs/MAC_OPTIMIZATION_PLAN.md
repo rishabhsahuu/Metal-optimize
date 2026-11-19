@@ -4,12 +4,13 @@
 save, M8's heat-based victim, off by default behind `STRATA_METAL_ADAPT`); M2 (router_route + gemv_cat in the decode
 window), M4 (the sampler in the window's command buffer) and M6 (the prompt chunk yields to the arena); and M3 (hcf
 compiled and wired, off behind `STRATA_METAL_HCF=1`). `metal/tests/fuse_parity.cpp` now covers gemv_cat, router_route,
-gr_norm_comb and hcf at every decode window size (1..8): ALL PASS. None of it has been measured on a Mac with a model,
-so no speed claim is made and every new path has an off switch. Every other item below is unimplemented; M5 is deferred
-because its condition ("the committed prefix did not move") has no observable without a model trace, and skipping a fold
-that was needed would change tokens.** Every performance number quoted is from this repository's docs or code comments and
-names what it was measured on; nothing was measured for this plan. Items marked *static analysis* are read from the code,
-not run.
+gr_norm_comb and hcf at every decode window size (1..8): ALL PASS. The arena work has now been run on the target Air
+("Measured on this Air", below); the four kernel and scheduling changes have not been compared with the branch point, so
+no speed claim is made for them and every new path has an off switch. Every other item below is unimplemented; M5 is
+deferred because its condition ("the committed prefix did not move") has no observable without a model trace, and
+skipping a fold that was needed would change tokens.** Every performance number quoted is from this repository's docs,
+code comments or the runs named below, and says what it was measured on. Items marked *static analysis* are read from the
+code, not run.
 
 Two repositories are compared:
 
@@ -123,20 +124,36 @@ The target pack is IQ3_XXS: quality over minimum size. That changes the arithmet
 - **Disk comes first.** IQ3_XXS is a 47.0 GB file plus the 28.8 GB n-gram table: 75.8 GB to download, plus about 6 GB
   of working space (`REPACK_WORK_GB` in `strata_control/mac_fit.py`). That is ~82 GB, against 68 GB free on this
   machine. Free roughly 15 GB before starting or the install stops part-way.
-- **It streams.** Resident needs about 55 GB (`model_need_gb`), against Metal's ~12.9 GB share of 16 GB. The arena lands
-  near 5 GB, so most experts are always cold. The engine's own rule recommends Q2_0 at this size
-  (`recommend_model`), so IQ3_XXS has to be chosen explicitly; the choice is kept with a warning (`docs/MAC.md`).
+- **It streams.** Resident needs about 55 GB (`model_need_gb`), against Metal's ~12.9 GB share of 16 GB. The arena
+  measured **3.37-3.42 GB** on this Air (1,728-1,752 slots of 24,576), so most experts are always cold. The engine's own
+  rule recommends Q2_0 at this size (`recommend_model`), so IQ3_XXS has to be chosen explicitly; the choice is kept with
+  a warning (`docs/MAC.md`).
 - **What it costs.** Measured on a 32 GB M4 with an 11.5-14.7 GB arena: 10.0 tok/s on a short question, 9.2 on a
   story, 7.7 after a 6K document, 65.8 tok/s on a 4K prompt. A 5.7-9.3 GB arena cost Q2_0 about 40 % of its decode
-  (14.1 -> 8.3), so expect roughly 5-6 tok/s here before throttling. That is an extrapolation, not a measurement.
+  (14.1 -> 8.3). On this Air the whole-request totals are **3.4-3.5 tok/s** (below).
 - **Per expert it is twice the work of Q2_0**: one expert layer takes 333 us against 166 us on the M4. The streaming
   path dominates, which is why M9, M7 and M8 come first for this pack.
-- **No draft layer.** A streamed Mac below 96 GB runs without MTP (`stream_mtp`), and its 1.2 GB is worth more as
-  arena.
+- **No MTP layer.** A streamed Mac below 96 GB runs without MTP (`stream_mtp`), and its 1.2 GB is worth more as
+  arena. DFlash2 drafting still runs (876 MiB) and earns its size: 413-736 drafts accepted per request.
 - **Context.** The default is 32K, but every KV cell competes with the arena. 8-16K is the sane setting here; 36,864
   tokens costs 0.65 GB a sequence (`docs/MAC.md`).
-- **What to expect in use.** 5-6 tok/s is roughly 200-270 words a minute, about reading speed. Usable for chat, slow
-  for an agent that writes long files.
+- **What to expect in use.** 3.4 tok/s is about 150 words a minute, slower than reading. Usable for chat, slow for an
+  agent that writes long files.
+
+### Measured on this Air (2026-11-19)
+
+| | |
+| --- | --- |
+| Before the arena preload fix (`KEEP_FREE_GB` 7) | 3.2 tok/s |
+| After it (`KEEP_FREE_GB=3.5`) | 3.4-3.5 tok/s on whole-request totals; 3.5-3.6 in the server's live readout |
+| Expert arena | 3.37-3.42 GB, 1,728-1,752 slots |
+| Profile preload | 1,490 experts at 2.17 GB/s in one run; 0 in a later run that had 7.0 GB free at planning |
+| Prompt | 69 tokens in 16.0 s: one pass over about 40 GB of experts at 2.5 GB/s |
+| Drafts | 736 of 1,149 (64 %) at 3.5 tok/s; 413 of 747 (55 %) at 3.4 tok/s |
+
+The live readout is a two-second window (`serve/server.py:313`), so it is not a build comparison; the request totals
+are. The four kernel and scheduling changes are inside the noise here: one dispatch less a layer is about 0.25 ms of a
+~290 ms token.
 
 None of this makes the model fit. The honest framing for a 16 GB Air is "less slow", not "fast", and a fanless Air
 throttles: every number must be taken twice, cold and after a few minutes, or it will flatter whichever build ran first.
