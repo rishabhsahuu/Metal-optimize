@@ -87,14 +87,14 @@ int main(int argc, char** argv) {
     // offset inside a run reads the mapping's bytes there, and the gaps between the runs are never bound.
     {
         std::vector<std::pair<uint64_t, uint64_t>> runs;
-        const uint64_t run = (uint64_t) 128 << 20;
+        const uint64_t run = (uint64_t) 384 << 20;   // (the probe reads 256 MB from the offset it binds)
         for (int i = 0; i < 3; ++i) runs.emplace_back((uint64_t) i * ((uint64_t) 1 << 30) + pg, run);
         mtl::Buffer R = cx.wrap_ranges(map, runs);
         check((bool) R.runs && R.runs->size() == runs.size(),
               "wrap_ranges: " + std::to_string(R.runs ? R.runs->size() : 0) + " runs");
         int bad = 0;
         for (const auto& r : runs)
-            for (uint64_t off : {r.first, r.first + ((uint64_t) 64 << 20)}) {
+            for (uint64_t off : {r.first, r.first + ((uint64_t) 128 << 20)}) {
                 auto* f = reinterpret_cast<float*>(static_cast<uint8_t*>(map) + off);
                 for (uint32_t i = 0; i < n; ++i) {
                     f[i] = (float) (off / pg) * 10.0f + (float) i;

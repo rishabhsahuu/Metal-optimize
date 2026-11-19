@@ -158,11 +158,13 @@ The target pack is IQ3_XXS: quality over minimum size. That changes the arithmet
 The dense-file arm is a memory result, not a speed one: the 2.84 GB left the anonymous footprint (8.11 -> 5.41 GB) but
 stayed in RAM as clean file pages, and `arena_avail` does not count hot file pages as free, so the arena grew 9 % (3.27
 -> 3.56 GB), not by the whole copy. The attempt to wrap the whole 47 GB shard instead of its dense runs (2026-11-19,
-same Air) hung the first window's GPU submit: `IOGPUCommandQueueSubmitCommandBuffers` never returned, the serve layer's
-60 s stall report fired, and the GPU stayed wedged for later processes (a trivial Metal copy hung too; a reboot clears
-it). That is why `wrap_ranges` exists and only the runs bound by a window are wrapped. The `wrap_split_test` case for
-`wrap_ranges` was added after that and has not been run yet: run
-`./build-metal/wrap_split_test` after a reboot.
+same Air) blocked the first window's GPU submit: `IOGPUCommandQueueSubmitCommandBuffers` never returned and the serve
+layer's 60 s stall report fired, twice. That is why `wrap_ranges` exists and only the runs bound by a window are
+wrapped. Later in the same session a trivial Metal copy hung as well, and the model's drive then dropped off the USB bus
+(`/Volumes/rishabhssd` gone, `diskutil list external` empty): a page of the shard's mapping on a dead drive blocks the
+submit that reads it, so the drive must be up for as long as the engine runs. It cleared once every process holding the
+mapping had exited, without a reboot. `./build-metal/wrap_split_test` then passed, the `wrap_ranges` case included
+(3 runs, both ends of each read right; the older `run_icb()` note of 3 wrong offsets remains).
 
 The fake-mode number is the floor for one step: with wrong routing the drafter proposes nothing, so each request is a
 one-token window. It says the expert reads are about three quarters of a decode step (74 ms against 259-283 ms a token),

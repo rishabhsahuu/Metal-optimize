@@ -142,7 +142,7 @@ All are off unless set. The defaults are the tuned path above.
 | `STRATA_METAL_HCF=1` | Fold `gr_norm` into the mixers and the MoE combine (M3) |
 | `STRATA_METAL_PROMPT_CHUNK=N` | Pin the prompt chunk in rows; the default is automatic and yields to the arena (M6) |
 | `STRATA_METAL_ARENA_GB=N` | Set the arena size explicitly |
-| `STRATA_METAL_DENSE_FILE=1` | Streaming: wrap the dense tensors' pages of the shard instead of a 2.84 GB copy. Smaller anonymous footprint (8.11 → 5.41 GB here); the arena grew 3.27 → 3.56 GB on this Air, not by the whole copy, because the pages still occupy RAM |
+| `STRATA_METAL_DENSE_FILE=1` | Streaming: wrap the dense tensors' pages of the shard instead of a 2.84 GB copy. Smaller anonymous footprint (8.11 → 5.41 GB here); the arena grew 3.27 → 3.56 GB on this Air, not by the whole copy, because the pages still occupy RAM. The drive must stay up while the engine runs: a page of the wrapped shard on a lost drive blocks the window |
 
 ## What is not here
 
