@@ -1838,8 +1838,10 @@ bool Window::stream_arena(std::string& err) {
         const double planned = budget;
         std::function<uint64_t()> recheck = [&]() -> uint64_t { return (uint64_t) arena_shrink(am, planned, avail_now()); };
         if (st_->make_arena(*cx_, (uint64_t) budget, prof, pg_on ? 576 : 64, err, minimal ? std::function<uint64_t()>() : recheck,
-                            [&](uint64_t step) { return arena_grow(am, avail_now(), (double) step); }))
+                            [&](uint64_t step) { return arena_grow(am, avail_now(), (double) step); })) {
+            err.clear();   // a retry that succeeded leaves the failed attempt's message in `err`: never report it
             break;
+        }
         if (st_->shrink_to() == 0 || tries == 4) return false;
         if ((double) st_->shrink_to() + 64.0 * (1 << 20) >= budget) minimal = true;   // no smaller layout than this one
         std::fprintf(stderr, "strata metal stream: less memory is free than when the arena was planned: %.1f -> %.1f GB\n",
@@ -3770,15 +3772,23 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
         const char* em = std::getenv("STRATA_METAL_PROMPT_GEMM_MIN");
         const int64_t mn = em ? std::atoll(em) : 64;
         if (!(e && std::string(e) == "0") && n >= mn) {
-            if (!g_window->prompt_gemm_init(err)) return false;
+            if (!g_window->prompt_gemm_init(err)) {
+                std::fprintf(stderr, "strata metal: the prompt path did not come up: %s\n", err.c_str());
+                return false;
+            }
             const int C = g_window->prompt_chunk_rows();
             std::vector<int32_t> tk32((size_t) C);
+            const bool trace = std::getenv("STRATA_METAL_TRACE") != nullptr;
             g_window->prompt_region(true);
             bool ok = true;
             for (int64_t c = 0; c < n && ok; c += C) {
                 const int k = (int) std::min<int64_t>(C, n - c);
                 for (int i = 0; i < k; ++i) tk32[(size_t) i] = (int32_t) tokens[c + i];
-                ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err) && (!on_chunk || on_chunk(nullptr, k, pos0 + c, err));
+                if (trace) std::fprintf(stderr, "strata metal: prompt chunk at %lld, %d rows\n", (long long) (pos0 + c), k);
+                ok = g_window->prompt_chunk(tk32.data(), k, pos0 + c, err);
+                if (ok && on_chunk) ok = on_chunk(nullptr, k, pos0 + c, err);
+                if (!ok) std::fprintf(stderr, "strata metal: the prompt chunk at %lld stopped: %s\n", (long long) (pos0 + c),
+                                      err.empty() ? "(no message)" : err.c_str());
             }
             g_window->prompt_region(false);
             return ok;
