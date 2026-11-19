@@ -78,6 +78,10 @@ is evicted, then read again on the way back.
 
 - Keep the LRU walk, but bounded: scan at most `S` slots from the tail (default 32) and take the lowest decayed heat,
   with the oldest winning ties. A full scan is O(slots) on the host turn, which is the wrong place for it.
+- **A bounded scan can come up empty.** A prompt pins its whole layer set (up to `NE` of a class) and its own misses
+  keep landing at the tail, so the 32 scanned slots can all be pinned while free slots remain further in. When
+  `coldest` finds nothing, `victim()` falls back to the full LRU walk rather than fail; without that fallback a 16 GB
+  Air with a warm arena exited with `no free slot (layer 0)` on its second big prompt.
 - **Hysteresis.** An expert is only worth keeping over the one it replaces when its heat beats it by a margin
   (`adapt-min-gain`'s role on CUDA). Without it, two nearly equal experts swap back and forth and each swap is an SSD
   read. **Not in the branch:** the first cut only chooses among the coldest of the scanned slots, which protects a hot

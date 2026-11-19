@@ -331,7 +331,14 @@ int ExpertStream::victim(int ci) {
                                       return x.layer < 0 ? -1e30f
                                                          : heat_[(size_t) x.layer * NE + (size_t) x.e];
                                   });
-    return s >= 0 ? evict(s) : -1;
+    if (s >= 0) return evict(s);
+    // `coldest` walks at most `adapt_scan_` slots from the tail and stops.  A prompt pins its whole layer set (up to
+    // NE of a class's slots), and its own misses keep landing at the tail, so the scanned window can be all pinned
+    // while the class still has free slots further in.  Fall back to the full LRU walk (the pre-adaptive behaviour)
+    // rather than exit: a 16 GB Air with a warm arena and a big prompt hit "no free slot (layer 0)" this way.
+    for (int i = k.tail; i >= 0; i = slots_[(size_t) i].prev)
+        if (usable_adapt(i)) return evict(i);
+    return -1;
 }
 
 // One piece of an expert: slice part / split_ (gate, up, down), piece part % split_ of it.  The pieces of one expert
