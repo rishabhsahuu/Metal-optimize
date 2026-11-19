@@ -428,7 +428,7 @@ private:
     int64_t n_vocab_ = 0;
     float eps_ = 1e-6f;
     // buffers
-    mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, h_, ye_, gsh_, ush_,
+    mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, rcnt_, h_, ye_, gsh_, ush_,
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
         emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_;
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
@@ -769,7 +769,8 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     R_ = A(4 * MAXT * HC * N); bo_ = A(4 * MAXT * N); inj_[0] = A(4 * MAXT * HC); inj_[1] = A(4 * MAXT * HC);
     xn_ = A(4 * MAXT * HC * N); lo_ = A(4 * MAXT * LR); qkv_ = A(4 * MAXT * G_CONV); z_ = A(4 * MAXT * G_ZV);
     al_ = A(4 * MAXT * G_HV); be_ = A(4 * MAXT * G_HV); yg_ = A(4 * MAXT * G_ZV); logits_ = A(4 * MAXT * 512);
-    ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); h_ = A(4 * MAXT * TOPK * NFF);
+    ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); rcnt_ = A(16); h_ = A(4 * MAXT * TOPK * NFF);
+    std::memset(rcnt_.ptr, 0, 16);   // router_route's last-arrival counter (it stores 0 when it is done)
     ye_ = A(4 * MAXT * TOPK * N); gsh_ = A(4 * MAXT * NFF); ush_ = A(4 * MAXT * NFF); ysh_ = A(4 * MAXT * N);
     sg_ = A(4 * MAXT * 4); qfull_ = A(4 * MAXT * G_QFULL); kcur_ = A(4 * MAXT * G_KV); vcur_ = A(4 * MAXT * G_KV);
     iqr_ = A(4 * MAXT * G_IQR); ikr_ = A(4 * MAXT * G_ID); qcur_ = A(4 * MAXT * G_QOUT); qidx_ = A(4 * MAXT * G_IH * G_ID);
@@ -1086,9 +1087,33 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         nb_ = true;
         gemv(ds, T(b + "attn_gate.weight"), XA_, zL_, G_ZV, ntok, o_z);
         nb_ = true;
-        gemv(ds, T(b + "ssm_alpha.weight"), XA_, alL_, G_HV, ntok, o_ab);
-        nb_ = true;
-        gemv(ds, T(b + "ssm_beta.weight"), XA_, beL_, G_HV, ntok, o_ab);
+        // M2: gemv_cat (gemv.metal) is ssm_alpha and ssm_beta in one dispatch, bitwise against the pair
+        // (metal/tests/fuse_parity.cpp).  STRATA_METAL_FUSED_GEMV_CAT=0 keeps the two dispatches.
+        {
+            static const bool cat_on = !(std::getenv("STRATA_METAL_FUSED_GEMV_CAT") &&
+                                         std::string(std::getenv("STRATA_METAL_FUSED_GEMV_CAT")) == "0");
+            const gguf::Tensor& tal = T(b + "ssm_alpha.weight");
+            const gguf::Tensor& tbe = T(b + "ssm_beta.weight");
+            if (cat_on && tal.type == tbe.type && (tal.type == ref::BF16 || tal.type == ref::F32)) {
+                GemvArgs ga{(uint32_t) N, (uint32_t) (2 * G_HV), (uint32_t) ntok, (uint32_t) ref::row_bytes(tal.type, N),
+                            (uint32_t) N, (uint32_t) G_HV};
+                const std::string fn = "gemvc_" + std::to_string(tal.type) + "_32_1_4";
+                mtl::Dispatch d;
+                d.p = P(lib_, fn, mtl::Constants().i(0, ntok), fn + "#" + std::to_string(ntok));
+                d.args = {mtl::Arg::B(W_, tal.offset), mtl::Arg::B(XA_.b, XA_.plane_bytes() * xkind(tal.type)),
+                          mtl::Arg::B(XA_.b, XA_.plane_bytes() * 4), mtl::Arg::B(alL_, o_ab), mtl::Arg::V(ga),
+                          mtl::Arg::B(W_, tbe.offset), mtl::Arg::B(beL_, o_ab), mtl::Arg::V((uint32_t) G_HV)};
+                d.grid[0] = (uint32_t) ((2 * G_HV + 3) / 4);   // 4 rows a threadgroup (32,1,4: SG 4, RG 1, NR 1)
+                d.tg[0] = 128;
+                nb_ = true;   // beside the qkv and gate GEMVs
+                push(ds, d);
+            } else {
+                nb_ = true;
+                gemv(ds, tal, XA_, alL_, G_HV, ntok, o_ab);
+                nb_ = true;
+                gemv(ds, tbe, XA_, beL_, G_HV, ntok, o_ab);
+            }
+        }
         GdnArgs a{G_HK, G_HV, G_CONV, cm, eps_, fuse_ ? (uint32_t) (MAXT * G_ZV) : 0u};
         mtl::Dispatch d;
         d.p = P(lgdn_, "gdn_step", x16c(mtl::Constants().i(2, ntok)), x16k("gdn_step#" + std::to_string(ntok)));
@@ -1208,8 +1233,16 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     // ---- the MoE
     gr_read(ds, b + "hc_ffn", true, XF_, false, ntok);
     const gguf::Tensor& trt = T(b + "ffn_gate_inp.weight");
-    gemv(ds, trt, XF_, logits_, 512, ntok);
-    nb_ = true;
+    // M2: router_route (router.metal) is the router GEMV and moe_route in one dispatch, bitwise against the pair
+    // (metal/tests/fuse_parity.cpp).  It is issued at moe_route's place below, once the tile arguments are known;
+    // until then the pair stays, and STRATA_METAL_FUSED_ROUTER=0 keeps it either way.
+    static const bool fused_router = !(std::getenv("STRATA_METAL_FUSED_ROUTER") &&
+                                       std::string(std::getenv("STRATA_METAL_FUSED_ROUTER")) == "0");
+    const bool fr = fused_router && (trt.type == ref::BF16 || trt.type == ref::F32);
+    if (!fr) {
+        gemv(ds, trt, XF_, logits_, 512, ntok);
+        nb_ = true;   // the next layer's prediction GEMV reads the same XF_
+    }
     if (stream_ && st_pred_ && l + 1 < G_NL) {   // the next layer's routing guessed from this layer's FFN input
         nb_ = true;   // beside the router GEMV
         gemv(ds, T("blk." + std::to_string(l + 1) + ".ffn_gate_inp.weight"), XF_, predL_, 512, ntok,
@@ -1272,9 +1305,21 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         a.gx_gu = NFF / (gs * (32 / gl) * gr);
         a.gx_dn = N / (ds_ * (32 / dl) * dr);
         mtl::Dispatch r;
-        r.p = P(lib_, "moe_route", {}, "moe_route");
-        r.args = {mtl::Arg::B(logits_), mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
-        r.tg[0] = 512;
+        if (fr) {
+            // the router GEMV writes logits_ with a 512-float row stride whatever n_expert is (nexp_ rows are computed)
+            GemvArgs ga{(uint32_t) N, (uint32_t) nexp_, (uint32_t) ntok, (uint32_t) ref::row_bytes(trt.type, N), (uint32_t) N, 512u};
+            const std::string fn = "router_route_" + std::to_string(trt.type);
+            r.p = P(lib_, fn, mtl::Constants().i(0, ntok), fn + "#" + std::to_string(ntok));
+            r.args = {mtl::Arg::B(W_, trt.offset), mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(trt.type)),
+                      mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4), mtl::Arg::B(logits_), mtl::Arg::V(ga), mtl::Arg::B(ids_),
+                      mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(rcnt_)};
+            r.grid[0] = (uint32_t) std::max(1, nexp_ / 16);   // the kernel's counter covers its threadgroups
+            r.tg[0] = 512;
+        } else {
+            r.p = P(lib_, "moe_route", {}, "moe_route");
+            r.args = {mtl::Arg::B(logits_), mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
+            r.tg[0] = 512;
+        }
         push(ds, r);
         {
             GlueArgs ga{NFF, MAXT, N, TOPK};

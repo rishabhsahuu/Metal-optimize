@@ -37,7 +37,7 @@ int main() {
     ref::random_blocks(ref::BF16, Wb.as<uint8_t>(), NO, N, 2, 0.05f);
     ref::Rng r(3);
     for (size_t i = 0; i < xp.bytes / 4; ++i) xp.as<float>()[i] = r.sym();
-    for (int nt = 1; nt <= 4; ++nt) {
+    for (int nt = 1; nt <= MAXT; ++nt) {   // every decode window size the engine builds
         mtl::Pipeline pg = cx.pipeline(lib, "gemv_30_32_1_4_1", mtl::Constants().i(0, nt)),
                       pc = cx.pipeline(lib, "gemvc_30_32_1_4", mtl::Constants().i(0, nt));
         const size_t s16 = (size_t)4 * 4 * MAXT * N;
@@ -75,7 +75,7 @@ int main() {
                     w2 = cx.alloc(4 * MAXT * 10), pl1 = cx.alloc(4 * P_INTS), pl2 = cx.alloc(4 * P_INTS), cnt = cx.alloc(16);
         ref::random_blocks(rty, Wr.as<uint8_t>(), NE, N, 9, 0.05f);
         mtl::Pipeline pr = cx.pipeline(lib, "moe_route");
-        for (int nt = 1; nt <= 4; ++nt) {
+        for (int nt = 1; nt <= MAXT; ++nt) {
             mtl::Pipeline pg = cx.pipeline(lib, "gemv_" + std::to_string(rty) + "_32_1_4_1", mtl::Constants().i(0, nt)),
                           pf = cx.pipeline(lib, "router_route_" + std::to_string(rty), mtl::Constants().i(0, nt));
             const size_t s16 = (size_t)4 * 4 * MAXT * N;
@@ -132,7 +132,7 @@ int main() {
         for (int i = 0; i < HC * N; ++i) wn.as<float>()[i] = 0.5f + r.uni();
         for (int i = 0; i < MAXT * TOPK; ++i) plan.as<int>()[P_TOKENT + i] = (i * 7) % (MAXT * TOPK);
         mtl::Pipeline pcm = cx.pipeline(lib, "moe_combine_sh"), pn = cx.pipeline(lib, "gr_norm"), pnc = cx.pipeline(lib, "gr_norm_comb");
-        for (int nt = 1; nt <= 4; ++nt) {
+        for (int nt = 1; nt <= MAXT; ++nt) {
             std::memcpy(R1.ptr, R0.ptr, R0.bytes);
             std::memcpy(R2.ptr, R0.ptr, R0.bytes);
             GlueArgs ga{(uint32_t)N, (uint32_t)nt, (uint32_t)N, TOPK};
