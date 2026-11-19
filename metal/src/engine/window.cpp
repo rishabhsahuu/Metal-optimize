@@ -2998,7 +2998,6 @@ bool Window::prompt_gemm_init(std::string& err) {
     if (T("blk.0.ffn_gate_exps.weight").type >= 144) p.gu_v3 = p.dn_v3 = false;   // the trellis experts have the v2 kernels only
     const char* eq = std::getenv("STRATA_METAL_PROMPT_QSA");       // v1 | flash (default: flash with the M5's layout)
     p.flash = eq ? std::string(eq) == "flash" : p.k4;
-    const size_t MT = (size_t) C;
     p.maxrows = C * TOPK + nexp_ * p.TM;
     p.nblk_max = (C * TOPK + 1023) / 1024;
     const int MB = (int) max_cells_ / 4 + 2;
@@ -3018,7 +3017,7 @@ bool Window::prompt_gemm_init(std::string& err) {
     auto F32 = [&](size_t n) { return AB(4 * n); };
     auto F16 = [&](size_t n) { return AB(2 * n); };
     auto make = [&] {
-        const size_t mr = (size_t) p.maxrows;
+        const size_t MT = (size_t) p.MT, mr = (size_t) p.maxrows;
         p.R = F32(MT * HC * N); p.bo = F32(MT * N); p.inj[0] = F32(MT * HC); p.inj[1] = F32(MT * HC); p.xnh = F16(MT * HC * N);
         p.V = F32(MT * (LR + HC)); p.loh = F16(MT * LR); p.mixed = F32(MT * N); p.mixh = F16(MT * N);
         p.qkv = F32(MT * G_CONV); p.z = F32(MT * G_ZV); p.al = F32(MT * G_HV); p.be = F32(MT * G_HV); p.yg = F32(MT * G_ZV);
@@ -3048,6 +3047,21 @@ bool Window::prompt_gemm_init(std::string& err) {
         }
     };
     make();
+    // M6: on a streamed Mac the chunk's buffers are a region of the expert arena (Basalt's tiers.cpp sizes the chunk by
+    // what the cache can hold, not by the RAM).  Keep them under half of the arena; the phys rule above only decides
+    // the starting point.  The chunk shrinks in halves, never below 128 rows; STRATA_METAL_PROMPT_CHUNK=1024 skips it.
+    if (stream_ && ec == nullptr) {
+        const size_t arena_b = st_->arena_used_bytes();
+        for (int tries = 0; tries < 3 && p.MT > 128 && need > arena_b / 2; ++tries) {
+            const int c = std::max(128, p.MT / 2 / 64 * 64);
+            p.MT = c;
+            p.QS = std::min(c, 256);
+            p.maxrows = c * TOPK + nexp_ * p.TM;
+            p.nblk_max = (c * TOPK + 1023) / 1024;
+            need = 0;
+            make();   // still measuring: nothing is allocated
+        }
+    }
     measure = false;
     if (stream_) {
         region = st_->region(need);
@@ -3056,7 +3070,7 @@ bool Window::prompt_gemm_init(std::string& err) {
     make();
     pg_ = pg.release();
     std::fprintf(stderr, "strata metal: prompts on the matrix units in chunks of %d (experts %s, QSA %s, matmul2d layout %s; "
-                         "%.2f GB of buffers%s)\n", C, p.gu_v3 ? "v3" : "v2", p.flash ? "flash" : "v1", p.k4 ? "K4" : "other",
+                         "%.2f GB of buffers%s)\n", p.MT, p.gu_v3 ? "v3" : "v2", p.flash ? "flash" : "v1", p.k4 ? "K4" : "other",
                  need / 1e9, stream_ ? ", in the expert arena while a prompt runs" : "");
     (void) err;
     return true;
