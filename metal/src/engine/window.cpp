@@ -248,6 +248,9 @@ public:
     bool sample_rows(int Tn, int32_t* out, std::string& err);
     bool sample_slot_row(int row, const strata::kernels::SamplerParams& sp, const int32_t* hist, int hist_len, int32_t* tok, std::string& err);   // one slot's row of a batch window, its own params
     bool sample_run(int row0, int n, const strata::kernels::SamplerParams& sp, const int32_t* hist, int hl, std::string& err);   // after run(): replaces out[0..Tn) (and tokout_) by the sampled tokens
+    bool sample_encode(std::vector<mtl::Dispatch>& ds, int row0, int n, const strata::kernels::SamplerParams& sp, const int32_t* hist, int hl,
+                       std::string& err);
+    void queue_sampling(int Tn, bool head);
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return n_vocab_; }
     bool ready() const { return cx_ != nullptr; }
@@ -393,6 +396,10 @@ private:
     mtl::Buffer sbias_, shist_, scv_, sci_;
     size_t shist_cap_ = 0, sbias_cap_ = 0;
     uint64_t samp_windows_ = 0;
+    // M4: the sampler's two dispatches ride in the window's own command buffer (its SampArgs carry the token counter,
+    // so they are appended to a copy of the cached list rather than cached with it); sample_rows then only reads tokout_
+    std::vector<mtl::Dispatch> samp_tail_;
+    bool samp_queued_ = false;
     std::map<std::string, mtl::Pipeline> pcache_;
     bool nb_ = false;
     // ---- DFlash2 (dflash2.inc)
@@ -1505,6 +1512,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
             if (kind == 2) d.grid[0] = (uint32_t) (((pos0 + Tn) / 4 + 1 + 7) / 8);
         }
         seg_T_ = Tn;
+        queue_sampling(Tn, head);
         const double r0 = now_ms();
         last_gpu_ms_ = 1000.0 * run_ds(c);
         {
@@ -1597,6 +1605,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     f16_enc_ = false;
     cuts_ = nullptr;
     seg_T_ = Tn;
+    queue_sampling(Tn, head);
     const double r0 = now_ms();
     last_gpu_ms_ = 1000.0 * run_ds(cw);
     tp_rg_ = now_ms() - r0;
@@ -1654,8 +1663,17 @@ bool Window::finish_rows(int Tn, const int32_t* tokens, int32_t* out, double t0)
 }
 
 double Window::run_ds(Cached& c) {
-    if (!stream_) return cx_->run_graph(c.ds);
-    return cx_->run_graph_seg(c.ds, c.cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
+    if (samp_tail_.empty()) {
+        if (!stream_) return cx_->run_graph(c.ds);
+        return cx_->run_graph_seg(c.ds, c.cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
+    }
+    // M4: the cached list plus this window's sampler (its SampArgs hold the token counter, so it is never cached)
+    std::vector<mtl::Dispatch> all = c.ds;
+    all.insert(all.end(), samp_tail_.begin(), samp_tail_.end());
+    samp_tail_.clear();
+    samp_queued_ = true;
+    if (!stream_) return cx_->run_graph(all);
+    return cx_->run_graph_seg(all, c.cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
 }
 
 namespace {
@@ -3397,9 +3415,20 @@ void Window::set_sampling(const strata::kernels::SamplerParams* sp, const int32_
     samp_hist_len_ = hist_len;
 }
 
+// M4: the sampler's dispatches for the window about to run.  Built before run_ds so they ride in its command buffer;
+// sample_rows then reads tokout_ instead of submitting a second graph of two small dispatches.
+void Window::queue_sampling(int Tn, bool head) {
+    samp_tail_.clear();
+    samp_queued_ = false;
+    if (!samp_on_ || !head || rows_ || Tn < 1 || Tn > MAXT) return;
+    std::string err;
+    if (!sample_encode(samp_tail_, 0, Tn, samp_, samp_hist_, samp_hist_len_, err)) samp_tail_.clear();
+}
+
 bool Window::sample_rows(int Tn, int32_t* out, std::string& err) {
     if (!samp_on_ || Tn < 1 || Tn > MAXT) return true;
-    if (!sample_run(0, Tn, samp_, samp_hist_, samp_hist_len_, err)) return false;
+    if (!samp_queued_ && !sample_run(0, Tn, samp_, samp_hist_, samp_hist_len_, err)) return false;
+    samp_queued_ = false;
     for (int t = 0; t < Tn; ++t) out[t] = tokout_.as<int32_t>()[t];
     return true;
 }
@@ -3413,6 +3442,22 @@ bool Window::sample_slot_row(int row, const strata::kernels::SamplerParams& sp, 
 
 // the chain over logits rows [row0, row0 + n) of lm_, written to tokout_[row0 ..]; row r's draw is Philox(seed, counter + r - row0)
 bool Window::sample_run(int row0, int n, const strata::kernels::SamplerParams& sp, const int32_t* hist_in, int hl, std::string& err) {
+    std::vector<mtl::Dispatch> ds;
+    if (!sample_encode(ds, row0, n, sp, hist_in, hl, err)) return false;
+    const double t0 = now_ms();
+    cx_->run_graph(ds);
+    ++samp_windows_;
+    static const bool st = std::getenv("STRATA_METAL_SAMPLE_STATS") != nullptr;
+    if (st && samp_windows_ % 200 == 0)
+        std::fprintf(stderr, "strata metal: sampler %llu windows, last %d rows in %.2f ms\n", (unsigned long long) samp_windows_, n,
+                     now_ms() - t0);
+    return true;
+}
+
+// M4: the same two dispatches, appended to a list that is submitted with the window they read (run_ds), so a sampled
+// request costs no second command buffer per window.  Same kernels, same buffers, same order: the tokens do not change.
+bool Window::sample_encode(std::vector<mtl::Dispatch>& ds, int row0, int n, const strata::kernels::SamplerParams& sp,
+                           const int32_t* hist_in, int hl, std::string& err) {
     const int Tn = n;
     const int64_t V = n_vocab_;
     constexpr uint32_t PARTS = 64;
@@ -3474,12 +3519,9 @@ bool Window::sample_run(int row0, int n, const strata::kernels::SamplerParams& s
     d2.p = P(lsmp_, "samp_pick", {}, "samp_pick");
     d2.args = {mtl::Arg::B(scv_, cand_off), mtl::Arg::B(sci_, cand_off), mtl::Arg::B(tokout_, 4 * (size_t) row0), mtl::Arg::V(a)};
     d2.grid[0] = (uint32_t) Tn; d2.tg[0] = 256;
-    const double t0 = now_ms();
-    cx_->run_graph({d1, d2});
-    ++samp_windows_;
-    static const bool st = std::getenv("STRATA_METAL_SAMPLE_STATS") != nullptr;
-    if (st && samp_windows_ % 200 == 0)
-        std::fprintf(stderr, "strata metal: sampler %llu windows, last %d rows in %.2f ms\n", (unsigned long long) samp_windows_, Tn, now_ms() - t0);
+    d1.barrier = true;   // it reads lm_, which the window's head GEMV wrote just before it
+    ds.push_back(d1);
+    ds.push_back(d2);
     return true;
 }
 
