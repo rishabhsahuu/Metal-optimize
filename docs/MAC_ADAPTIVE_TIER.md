@@ -6,7 +6,8 @@ quoted are from [MAC.md](MAC.md), each with what it was measured on. The numbers
 
 This is not a Basalt port. Basalt's speed on Blackwell comes from FP4 tensor cores, a discrete VRAM tier and CUDA; none of
 those exist on a Mac. The one idea worth taking is the adaptive expert tier, and Strata already runs it on its CUDA and HIP
-engines. This page is how to give the same behaviour to the Mac's SSD-streaming arena.
+engines. This page is how to give the same behaviour to the Mac's SSD-streaming arena. It is one item in the wider
+[MAC_OPTIMIZATION_PLAN.md](MAC_OPTIMIZATION_PLAN.md).
 
 ## What each engine has today
 

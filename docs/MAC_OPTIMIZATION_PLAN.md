@@ -1,0 +1,146 @@
+# Making the Mac engine faster: working plan
+
+**Status: working document, branch `metal-optimize`. Nothing here is built. Every performance number quoted is from this
+repository's docs or code comments and names what it was measured on; nothing was measured for this plan.** Items marked
+*static analysis* are read from the code, not run.
+
+Two repositories are compared:
+
+- **Strata** (`metal/`): the engine we change. Source of every measured Mac number below.
+- **Basalt** (`/Users/rishabhsahu/coding/basalt`): a fork of Strata for one target, NVIDIA Blackwell. What it teaches is
+  placement, scheduling and serving policy. Its execution tricks (FP4/FP8 tensor cores, TMA, PDL) have no Metal analogue
+  and are listed under [what does not transfer](#what-does-not-transfer).
+
+Companion document: [MAC_ADAPTIVE_TIER.md](MAC_ADAPTIVE_TIER.md) (the expert-placement part, in detail).
+
+## Where a Mac's time goes
+
+| Measurement | Value | Measured on | Source |
+| --- | --- | --- | --- |
+| One 2-token decode window | 111 ms: routed experts ~40, dense ~66 before the tile change | M4 Mac mini 32 GB, Gyro-S streamed | [MAC.md](MAC.md#history--older-measurements) |
+| The same window with `STRATA_METAL_F16=1` | 56-60 ms -> 40-41 ms | M1 Max 34 GB, Q2_0 streamed | [MAC.md](MAC.md#switches) |
+| SSD wait per token, experts' copy | 46.6 -> 31.5 ms | M4 Mac mini 32 GB, IQ3_XXS, 6K document | [MAC.md](MAC.md#history--older-measurements) |
+| Prompt chunk 1024 / 2048 / 4096 | 700 / 920 / 1,100 tok/s at 4K | M5 Max 128 GB, UD-Q5 streamed | [MAC.md](MAC.md#history--older-measurements) |
+| Dense GEMV tile change | 1.17 -> 0.99 ms | M5 Max, GDN out projection | `metal/src/engine/window.cpp:88` |
+| Fused GDN input GEMM | 3.09 -> 2.87 ms a layer | M5 Max, T 2048 | `metal/src/engine/window.cpp:96` |
+| One dispatch + barrier | ~7 us | decode chain | `metal/kernels/hcf.metal:11` |
+| QSA attention load stalls | ~30 us a layer at a 1,000-cell context | decode | `metal/kernels/qsab.metal:2` |
+| Expert layer, one token | 278 us (37.5 GB/s), IQ3_XXS 333 us, Q2_0 166 us | M4 Mac mini 32 GB, Gyro-S | [MAC.md](MAC.md#history--older-measurements) |
+
+What that means, in two regimes:
+
+- **Streamed Mac (16 to 48 GB).** The arena holds a few GB, every window misses on many experts, and each of the 48
+  layers costs a host turn (a GPU signal, a host lookup, reads, and a GPU wait). Decode is dominated by the expert path
+  and the per-layer handshake, not by arithmetic. The 111 ms window above splits roughly 40 % experts, 60 % dense.
+- **Resident Mac (96 GB and up).** The experts come from the same memory as the dense weights, the handshake is still
+  there but has no I/O to do, and the dense kernels dominate. Kernel-level wins matter most here; on a streamed Mac
+  they matter less but are not free.
+
+On the 16 GB MacBook Air, the arena is about 5 GB, so it sits at the far end of the first regime: the plan below is
+ordered so that the items that help *that* machine come first.
+
+## The queue
+
+Effort is small (one file, no new kernel family), medium (a kernel family or a scheduling change), or large (buffers,
+numerics). "Output" says whether tokens can change.
+
+### P0: small, low risk, do first
+
+| ID | Change | Files | Evidence it pays | Effort | Output |
+| --- | --- | --- | --- | --- | --- |
+| M1 | Turn on the fp16 decode windows for **streamed** packs | `window.cpp` `f16_auto_for` (`:167-173`) | The function returns false when streaming, so a streamed Mac never gets it unless forced. Forced on an M1 Max: a 2-token window 56-60 -> 40-41 ms, mean KL 0.009 against fp32 | small | Yes (fp16 math), so opt-in first, then a measured default |
+| M2 | Wire `router_route` and `gemv_cat` into the engine | `router.metal`, `gemv.metal`, `window.cpp` | Both exist and are bitwise-checked against the two-dispatch form in `metal/tests/fuse_parity.cpp`; today only `token_chain` uses them | small | No |
+| M3 | Compile `hcf.metal` and fold `gr_norm` into its producers | `msl_libs.h` (`lib_core`), `hcf.metal` | Not compiled at all today; `hcf.metal:9-12` claims bitwise and its comment records -10.9 % on the HC read (*static*) | small | No |
+| M4 | Append sampling to the window's command buffer | `window.cpp:3433` | A whole `run_graph` per window for two small dispatches; greedy already reduces in-graph (`argmax_part`) | small | No |
+| M5 | Skip the fold when nothing changed | `window.cpp:2041-2063` | One `gdn_step` dispatch for each of the 36 GDN layers per fold pass, even when the committed prefix did not move (*static*) | small | No |
+| M6 | Size the prompt chunk from the arena, not from RAM | `window.cpp:2911-2919` | Today `phys >= 96 GB ? 4096 : 1024`. Basalt bisects the largest chunk whose expert slots fit the cache (+128); our own curve is still rising at 4,096 | small | No |
+
+M1 is the single largest cheap win: it is a condition change, not a kernel, and the fallback is one environment variable.
+It needs a quality gate first (100-chunk KLD and the 61-task suite on a streamed Q2_0 or IQ3_XXS), because the KL cost
+was 0.009 on the M1 Max. Gyro trellis packs have no fp16 decode (`x16_kind` returns -1 for the TQ types), so they are
+unaffected and must be tested for no regression.
+
+### P1: medium
+
+| ID | Change | Files | Evidence it pays | Effort | Output |
+| --- | --- | --- | --- | --- | --- |
+| M7 | Learned expert profile (stage 1 of the adaptive tier) | `stream.h/.cpp`, `core/expert_cache` | The arena starts from a shipped profile built on another trace. On a small Mac the top of that ranking is most of the hit rate | small | No |
+| M8 | Heat-based victim with a margin (stage 2) | `stream.cpp` `victim()`, new `stream_policy.h` | Pure LRU today; a topic excursion evicts hot experts | medium | No |
+| M9 | Take the streaming handshake off the critical path | `window.cpp:1316`, `:3249`; `stream.cpp` `at_layer` | One cut per layer, and the GPU waits in `done_cv_`. Basalt's device-planned MoE does the same job without a host turn; step 1 (no cut when a layer is fully resident) is small, step 2 (look two layers ahead with `pred2`) is the structural one | medium | No |
+| M10 | Use the batched QSA attention for short contexts | `qsab.metal`, `msl_libs.h` | Load stalls ~30 us a layer at 1,000 cells; the kernel is bitwise with `qsa_attn` (*static*) | small | No |
+| M11 | Head: fused top-1 for sampled requests; a two-stage screen for large packs | `window.cpp`, `gemv.metal`, `sample.metal` | Basalt's two-stage head: 350 vs 439 us a window (NVFP4, 400 W + 180 W). Our head is read once a window; 248,320 rows x 2,560 at Q8_0 is ~675 MB, roughly 6-8 ms on an Air's memory bandwidth (*estimate from 120 GB/s theoretical*) | medium | Greedy no; a Q6_K proxy shifts the sampled tail (Basalt: KLD 0.0022) |
+| M12 | Short-step flash attention for 1-3 row windows | `qsa.metal`, `stubs.cpp:253` | `qsa_flash` exists for prompts only; a decode window always takes the scalar path (*static*) | medium | No |
+
+M9 is the highest-value structural item for the 16 GB Air, because at ~5 GB of arena almost every layer misses. It is
+also the riskiest of P1: the arena must hold two layers' worth of slots at once, and a mistake shows up as a stall, not
+a wrong token.
+
+### P2: large, or gated on measurement that does not exist yet
+
+| ID | Change | Evidence / reason to wait | Effort | Output |
+| --- | --- | --- | --- | --- |
+| M13 | `MAXT` 8 -> 16, two rows a slot | Basalt's window GEMM takes 32 rows with the same per-row bit argument. Needs per-slot draft state and every `NTOK` specialisation recompiled | large | No |
+| M14 | Grouped expert GEMM across batch slots | `--parallel 4` gives 119-125 tok/s aggregate against 96-100 for one request (M5 Max, IQ3_S) yet window per slot reads the weights again | large | No |
+| M15 | int8 prompt GEMM through MetalPerformancePrimitives | `metal/kernels/mm_i8.metal` is a probe that asks whether the matrix unit runs int8 faster than fp16; it is not built by `metal/CMakeLists.txt` and no result is recorded. Prefill only: decode is bandwidth-bound | large | Yes |
+| M16 | GDN prompt recurrence as matmuls | Basalt expresses the 16-token update as matmuls; our scan is one lane per state column and the trellis profile says decode is ALU-bound. It changes the recurrence's rounding | large | Yes |
+
+## What does not transfer
+
+One line each, all verified in Basalt's own docs and code:
+
+- **FP4 and FP8 tensor cores** (`mxf4nvf4`, E4M3) and **TMA**-fed GEMM: Apple GPUs have neither.
+- **PDL** (programmatic dependent launch) and **CUDA graphs**: a Metal command buffer is the replacement for the second,
+  and it is already used.
+- **VMM** segmented expert cache, elastic KV, hot VRAM resize: no page-granular GPU mappings; our arena already shrinks
+  by dropping chunks.
+- **Page-locked host memory** and **PCIe split** (`--pcie-frac`): host and GPU memory are the same memory.
+- **Peer GPUs**, layer splits, prompt splits: one GPU per Mac.
+- **NVDEC / CUDA vision kernels**, **AVX2 CPU expert kernels**: no Metal path, and a CPU expert tier on a Mac would add
+  a second reader of the same memory.
+- **`cpu-share` for prompt experts**: on CUDA it exists because copying over PCIe costs more than the arithmetic. Here
+  the expert is already in memory; keep the CPU out of it.
+
+The reversal to watch: Metal *does* expose int8 matrix operations through MetalPerformancePrimitives, which Basalt's
+CUDA-only view does not see. That is M15, and it is a prefill question, not a decode one.
+
+## On a 16 GB MacBook Air
+
+- The model does not fit: Q2_0 is a 37.6 GB file plus a 28.8 GB n-gram table, about 66 GB to download, against ~68 GB
+  of free disk on this machine, and ~46 GB to stay resident. It streams, with an arena of about 5 GB.
+- The items that can move it: **M1** (dense time), **M9** (the 48 handshakes a token), **M7/M8** (which experts wait),
+  then M2-M5 as a few percent each. M6 does nothing here: the chunk stays at its floor. M13/M14 need several users.
+- None of it makes the model fit. The honest framing for a 16 GB Air is "less slow", not "fast".
+- A fanless Air throttles. Every number must be taken twice, cold and after a few minutes, or it will flatter whichever
+  build ran first.
+
+## How to measure
+
+Fixtures: this MacBook Air M4 16 GB, and a 32 GB M4 Mac mini (the engine's own streaming fixture, so the numbers line up
+with [MAC.md](MAC.md)). One pack per machine; the arena pinned with `STRATA_METAL_ARENA_GB` so arms are comparable.
+
+- **Arms:** one change at a time against the branch point. Never two.
+- **Metrics:** decode tok/s on a short question, a story, code and JSON; prompt tok/s at 4K and 16K; `at_layer` hit rate
+  and prefetch hit rate from `ExpertStream::report()`; SSD MB per token; stall ms a window.
+- **Attribution:** `STRATA_METAL_KPROF=1`, `STEPPROF`, `PROMPT_KPROF` and `STRATA_METAL_TRACE=1` already exist
+  (`window.cpp:1772-1965`). Use them instead of guessing which kernel moved.
+- **Protocol:** a fresh process per arm; interleaved pairs; medians of five; identical tokens against the branch point
+  where the change claims no output change; the arena size and free disk recorded with every run; battery state noted.
+- **Report the failures.** A change that is neutral is a result; a change measured on one machine once is not.
+
+## First three commits
+
+1. `metal: fp16 decode windows for streamed packs (opt-in, measured)` — M1, behind `STRATA_METAL_F16=1`, with the KL and
+   task-suite gate and a benchmark table in the message.
+2. `metal: router_route and gemv_cat in the decode window (bitwise)` — M2, checked with `metal/tests/fuse_parity.cpp`.
+3. `metal: hcf in lib_core, norm folded into its producer (bitwise)` — M3.
+
+Each one keeps the default path byte-identical until its measurement says otherwise, per `CONTRIBUTING.md`.
+
+## Open questions
+
+- Does fp16 decode help a 5 GB arena as much as the M1 Max's 64-slot one? Unmeasured.
+- How much does the Air throttle over a 10-minute run, and does that hide kernel wins? Unmeasured.
+- Is `stubs_gyro.cpp`'s "trellis unsupported" comment stale against the working path in `window.cpp:1252`? Worth
+  confirming with the maintainer before touching the Gyro kernels.
+- Q2_0 or Gyro-S on this Air: 66 GB and 58.5 GB of download respectively, against 68 GB free. Neither leaves room for
+  the experts' copy, which is the +17 % decode item in [MAC.md](MAC.md).
