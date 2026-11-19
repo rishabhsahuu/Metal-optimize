@@ -47,6 +47,14 @@ batch.
 and 1,024 tokens both pay one read of about 40 GB. That is why a short prompt shows 4.3 tok/s and a 1,024-token prompt
 would show about 64 tok/s for the same wall time.
 
+**A 16 GB Air cannot hold two expert caches.** `--expert-cache 3700` (3,921 slots, 6.39 GiB) is the *host* code's
+cache. The Metal window does not read it: it streams the same experts from the `.experts` file into its own arena, and
+every request's report says `GPU 0 hits this request`. With the flag set the process held 8.1 GB before the arena and
+`arena_budget` allowed only 1.0–3.2 GB, while the arena's floor is 3.4 GB (a prompt chunk's layer needs 576 slots in
+each of three size classes); the arena was forced over the budget and a 3,575-token prompt then failed on its second
+chunk. Without the flag the same machine has that memory for the window's arena. `--mmap-experts` stays on (it maps the
+file; it does not copy 47 GB into RAM).
+
 ## Eight changes so far
 
 Six of the sixteen items in [the plan](docs/MAC_OPTIMIZATION_PLAN.md) are implemented (M2, M3, M4, M6, M7, M8). Rows 3
@@ -61,7 +69,7 @@ and 8 are the configuration that made the measured step possible.
 | 5 | `gr_norm` folded into the mixer GEMVs and the MoE combine (`hcf.metal`) | M3 | **off**, `STRATA_METAL_HCF=1` | `fuse_parity`: bo, R′, xn bitwise, 1–8 tokens | −10.9 % on the HC read, measured on an M5 Max UD-Q4_K_XL (from `hcf.metal`); not measured here |
 | 6 | The sampler rides in the window's command buffer | M4 | on | Same kernels, same buffers, same order | One command buffer fewer a window (<1 ms, static) |
 | 7 | The prompt chunk yields to the live arena (halves in 128-row steps) | M6 | on, shrink only | Did not trigger at 3.37 GB (1.60 GB of buffers is under half) | A large chunk's buffers cannot evict the arena it is trying to use |
-| 8 | The tuned configuration: 32K context, `--expert-cache 3700`, `--mmap-experts`, budget 1,024 | — | `run-iq3_xxs-tuned.sh` | The runs above | The numbers above |
+| 8 | The tuned configuration: 32K context, `--mmap-experts`, no `--expert-cache` (the window's arena is the only expert cache), budget 1,024 | — | `run-iq3_xxs-tuned.sh` | The runs above | The numbers above; with the host cache on, 6.4 GiB competed with the arena |
 
 ## Setup
 
@@ -99,7 +107,8 @@ The same settings from the installation script's `strata` command:
 strata launch --family qwen --model iq3_xxs --context 32k --yes --no-tui
 ```
 
-Useful flags: `--expert-cache N`, `--mmap-experts`, `--spec N`, `--api-key-env NAME`, `--new-key`, `--speed faster`.
+Useful flags: `--mmap-experts`, `--spec N`, `--api-key-env NAME`, `--new-key`, `--speed faster`. Leave
+`--expert-cache N` off: it is the host code's cache, and the Metal window's arena is the cache it uses.
 The server prints its addresses and keeps running; `strata launch --status` shows it, `--stop` stops it.
 
 ### Tests

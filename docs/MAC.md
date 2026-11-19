@@ -265,6 +265,7 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_METAL_STREAM=1` / `=0` | Stream the experts from the SSD even when the pack fits / never (the default decides by size) |
 | `STRATA_METAL_CONTIG=0` | Streaming: read the model file even when the experts' copy is there |
 | `STRATA_METAL_ARENA_GB=N`, `STRATA_METAL_KEEP_FREE_GB=N` | Streaming: the arena's size, or the memory left to macOS |
+| `--expert-cache N` (a command flag, not an env) | The host code's expert cache. The Metal window streams into its own arena instead and every request reports `GPU 0 hits`: the slots are memory the arena cannot use (3,921 slots = 6.39 GiB left a 16 GB Air 1.0–3.2 GB for an arena whose prompt layout needs 3.4 GB). Leave it off |
 | `STRATA_METAL_LEAVE_SHARE=0.4` | Streaming, 64 GB or more: the share of the RAM left to macOS when the footprint cap is set |
 | `STRATA_METAL_WIRE_ARENA=0` | Streaming, 64 GB or more: leave the filled arena pageable (default: wired) |
 | `STRATA_METAL_IGNORE_REPACK=1` | Start although a model repack or setup's preparation is running (the engine refuses by default) |
