@@ -259,6 +259,8 @@ For testing. All are off unless set; the defaults are described above.
 | `STRATA_METAL_MTP_Q8=0` | The draft layer's matrices in BF16 instead of Q8_0 |
 | `STRATA_METAL_MTP_CHAIN=0` | One GPU submission per draft step instead of one per round |
 | `STRATA_METAL_FUSE=0`, `STRATA_METAL_LAZY_FOLD=0` | Turn off two decode fusions (same tokens, slower) |
+| `STRATA_METAL_FUSED_ROUTER=0`, `STRATA_METAL_FUSED_GEMV_CAT=0` | Turn off the router GEMV + moe_route fusion and the GDN alpha + beta fusion (bitwise, `metal/tests/fuse_parity.cpp`) |
+| `STRATA_METAL_HCF=1` | Fold `gr_norm` into the mixer GEMVs and the MoE combine (`hcf.metal`; bitwise against the 32,1,8,2 tile, `fuse_parity`) |
 | `STRATA_METAL_PROMPT_EXPERTS=v3` | The M5 layout for the prompt's expert GEMMs. Fails on an M1 Max, so it is off there (default v2) |
 | `STRATA_METAL_STREAM=1` / `=0` | Stream the experts from the SSD even when the pack fits / never (the default decides by size) |
 | `STRATA_METAL_CONTIG=0` | Streaming: read the model file even when the experts' copy is there |

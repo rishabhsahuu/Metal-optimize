@@ -1,11 +1,15 @@
 # Making the Mac engine faster: working plan
 
-**Status: working document, branch `metal-optimize`. Batch 1 is in the branch: the adaptive placement policy (M7's counts
-and profile save, M8's heat-based victim), off by default behind `STRATA_METAL_ADAPT`, with `metal/tests/stream_policy_test.cpp`
-passing and the engine compiling. It has not been measured on a Mac with a model, so it is not a default and no speed
-claim is made. Every other item below is unimplemented.** Every performance number quoted is from this repository's docs
-or code comments and names what it was measured on; nothing was measured for this plan. Items marked *static analysis* are
-read from the code, not run.
+**Status: working document, branch `metal-optimize`. In the branch: the adaptive placement policy (M7's counts and profile
+save, M8's heat-based victim, off by default behind `STRATA_METAL_ADAPT`); M2 (router_route + gemv_cat in the decode
+window), M4 (the sampler in the window's command buffer) and M6 (the prompt chunk yields to the arena); and M3 (hcf
+compiled and wired, off behind `STRATA_METAL_HCF=1`). `metal/tests/fuse_parity.cpp` now covers gemv_cat, router_route,
+gr_norm_comb and hcf at every decode window size (1..8): ALL PASS. None of it has been measured on a Mac with a model,
+so no speed claim is made and every new path has an off switch. Every other item below is unimplemented; M5 is deferred
+because its condition ("the committed prefix did not move") has no observable without a model trace, and skipping a fold
+that was needed would change tokens.** Every performance number quoted is from this repository's docs or code comments and
+names what it was measured on; nothing was measured for this plan. Items marked *static analysis* are read from the code,
+not run.
 
 Two repositories are compared:
 
@@ -58,11 +62,11 @@ numerics). "Output" says whether tokens can change.
 handshake), M7 and M8 (placement) ahead of M1, which on this pack can only touch the dense side. The rest of P0 stays:
 they are bitwise, cheap and independent of the pack.
 
-| M2 | Wire `router_route` and `gemv_cat` into the engine | `router.metal`, `gemv.metal`, `window.cpp` | Both exist and are bitwise-checked against the two-dispatch form in `metal/tests/fuse_parity.cpp`; today only `token_chain` uses them | small | No |
-| M3 | Compile `hcf.metal` and fold `gr_norm` into its producers | `msl_libs.h` (`lib_core`), `hcf.metal` | Not compiled at all today; `hcf.metal:9-12` claims bitwise and its comment records -10.9 % on the HC read (*static*) | small | No |
-| M4 | Append sampling to the window's command buffer | `window.cpp:3433` | A whole `run_graph` per window for two small dispatches; greedy already reduces in-graph (`argmax_part`) | small | No |
+| M2 | Wire `router_route` and `gemv_cat` into the engine — **in the branch** | `router.metal`, `gemv.metal`, `window.cpp` | Both exist and are bitwise-checked against the two-dispatch form in `metal/tests/fuse_parity.cpp` (now 1..8 tokens); today only `token_chain` uses them. In the decode window for BF16/F32 routers; `STRATA_METAL_FUSED_ROUTER=0` / `_GEMV_CAT=0` keep the pairs | small | No |
+| M3 | Compile `hcf.metal` and fold `gr_norm` into its producers — **in the branch, opt-in** | `msl_libs.h` (`lib_core`), `hcf.metal` | Was in no library list; now compiled and checked bitwise in `fuse_parity` (gemvh_ vs gemv 32,1,8,2 + gr_norm; moe_combine_hcf vs moe_combine_sh + gr_norm, 1..8 tokens). `STRATA_METAL_HCF=1` wires the two mixers and the MoE combine; the -10.9 % in `hcf.metal:9-12` is an M5 Max, UD-Q4_K_XL measurement (*static* here) | small | No |
+| M4 | Append sampling to the window's command buffer — **in the branch** | `window.cpp:3433` | A whole `run_graph` per window for two small dispatches; greedy already reduces in-graph (`argmax_part`). The list is copied per window because SampArgs carries the token counter | small | No |
 | M5 | Skip the fold when nothing changed | `window.cpp:2041-2063` | One `gdn_step` dispatch for each of the 36 GDN layers per fold pass, even when the committed prefix did not move (*static*) | small | No |
-| M6 | Size the prompt chunk from the arena, not from RAM | `window.cpp:2911-2919` | Today `phys >= 96 GB ? 4096 : 1024`. Basalt bisects the largest chunk whose expert slots fit the cache (+128); our own curve is still rising at 4,096 | small | No |
+| M6 | Size the prompt chunk from the arena, not from RAM — **in the branch (shrink only)** | `window.cpp:2911-2919` | Was `phys >= 96 GB ? 4096 : 1024`. Now the measured buffers must stay under half the live arena, halving in 128-row steps first; growth still follows the phys rule, because the bisection up needs a measurement we do not have | small | No |
 
 M1 is the single largest cheap win: it is a condition change, not a kernel, and the fallback is one environment variable.
 It needs a quality gate first (100-chunk KLD and the 61-task suite on a streamed IQ3_XXS), because the KL cost
@@ -153,13 +157,17 @@ prompt.
   where the change claims no output change; the arena size and free disk recorded with every run; battery state noted.
 - **Report the failures.** A change that is neutral is a result; a change measured on one machine once is not.
 
-## First three commits
+## Commits so far (branch `metal-optimize`)
 
-1. `metal: router_route and gemv_cat in the decode window (bitwise)` — M2, checked with `metal/tests/fuse_parity.cpp`.
-   No quality gate needed, so it is the safe place to start.
-2. `metal: hcf in lib_core, norm folded into its producer (bitwise)` — M3.
-3. `metal: learned expert profile for the streaming arena (opt-in)` — M7, measured on IQ3_XXS on the mini and the Air,
-   with the arena size recorded.
+1. `metal: adaptive expert placement (opt-in), with the policy test` — M7/M8, policy checked by
+   `metal/tests/stream_policy_test.cpp`; the arena preload it needs was blocked by the keep-free rule on a 16 GB Air
+   (see "On a 16 GB MacBook Air").
+2. `metal: router_route and gemv_cat in the decode window (bitwise)` — M2, checked with `metal/tests/fuse_parity.cpp`.
+3. `metal: the sampler rides in the window's command buffer` — M4.
+4. `metal: the prompt chunk yields to the arena, not to the RAM size` — M6 (shrink only).
+5. `metal: hcf compiled and wired into the HC reads, opt-in` — M3, kernels checked with `fuse_parity`.
+
+The next four are M5 (deferred: no observable without a model trace), M9, M10 and M1, in that order for the Air.
 
 M1 is a separate experiment, not a first commit: on a streamed IQ3_XXS it can only touch the dense GEMVs, and its effect
 on this pack is unmeasured. Run it behind `STRATA_METAL_F16=1` with a 100-chunk KLD gate and the 61-task suite before it
