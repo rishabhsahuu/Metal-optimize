@@ -1,8 +1,11 @@
 # Making the Mac engine faster: working plan
 
-**Status: working document, branch `metal-optimize`. Nothing here is built. Every performance number quoted is from this
-repository's docs or code comments and names what it was measured on; nothing was measured for this plan.** Items marked
-*static analysis* are read from the code, not run.
+**Status: working document, branch `metal-optimize`. Batch 1 is in the branch: the adaptive placement policy (M7's counts
+and profile save, M8's heat-based victim), off by default behind `STRATA_METAL_ADAPT`, with `metal/tests/stream_policy_test.cpp`
+passing and the engine compiling. It has not been measured on a Mac with a model, so it is not a default and no speed
+claim is made. Every other item below is unimplemented.** Every performance number quoted is from this repository's docs
+or code comments and names what it was measured on; nothing was measured for this plan. Items marked *static analysis* are
+read from the code, not run.
 
 Two repositories are compared:
 
@@ -70,8 +73,8 @@ unaffected and must be tested for no regression.
 
 | ID | Change | Files | Evidence it pays | Effort | Output |
 | --- | --- | --- | --- | --- | --- |
-| M7 | Learned expert profile (stage 1 of the adaptive tier) | `stream.h/.cpp`, `core/expert_cache` | The arena starts from a shipped profile built on another trace. On a small Mac the top of that ranking is most of the hit rate | small | No |
-| M8 | Heat-based victim with a margin (stage 2) | `stream.cpp` `victim()`, new `stream_policy.h` | Pure LRU today; a topic excursion evicts hot experts | medium | No |
+| M7 | Learned expert profile (stage 1 of the adaptive tier) — **in the branch, opt-in** | `stream.h/.cpp`, `core/expert_cache` | The arena starts from a shipped profile built on another trace. On a small Mac the top of that ranking is most of the hit rate | small | No |
+| M8 | Heat-based victim (stage 2) — **in the branch, opt-in** | `stream.cpp` `victim()`, new `stream_policy.h` | Pure LRU today; a topic excursion evicts hot experts | medium | No |
 | M9 | Take the streaming handshake off the critical path | `window.cpp:1316`, `:3249`; `stream.cpp` `at_layer` | One cut per layer, and the GPU waits in `done_cv_`. Basalt's device-planned MoE does the same job without a host turn; step 1 (no cut when a layer is fully resident) is small, step 2 (look two layers ahead with `pred2`) is the structural one | medium | No |
 | M10 | Use the batched QSA attention for short contexts | `qsab.metal`, `msl_libs.h` | Load stalls ~30 us a layer at 1,000 cells; the kernel is bitwise with `qsa_attn` (*static*) | small | No |
 | M11 | Head: fused top-1 for sampled requests; a two-stage screen for large packs | `window.cpp`, `gemv.metal`, `sample.metal` | Basalt's two-stage head: 350 vs 439 us a window (NVFP4, 400 W + 180 W). Our head is read once a window; 248,320 rows x 2,560 at Q8_0 is ~675 MB, roughly 6-8 ms on an Air's memory bandwidth (*estimate from 120 GB/s theoretical*) | medium | Greedy no; a Q6_K proxy shifts the sampled tail (Basalt: KLD 0.0022) |

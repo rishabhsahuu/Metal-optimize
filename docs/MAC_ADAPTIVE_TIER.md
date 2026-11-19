@@ -1,8 +1,10 @@
 # The adaptive expert tier on the Mac (proposal)
 
-**Status: proposal. Nothing on this page is implemented, and nothing on it is a measurement of the feature.** The Mac numbers
-quoted are from [MAC.md](MAC.md), each with what it was measured on. The numbers a change would have to beat are named in
-[What to measure](#what-to-measure); until they exist, this is a design and not a claim.
+**Status: the placement policy is in the branch and off by default. The counts, the heat-based victim and the profile save
+are implemented (`metal/src/engine/stream.cpp`, `metal/src/engine/stream_policy.h`, with
+`metal/tests/stream_policy_test.cpp` passing); the proactive rounds are not, and none of it has been measured on a Mac with
+a model. Nothing on this page is a speed claim.** The Mac numbers quoted are from [MAC.md](MAC.md), each with what it was
+measured on. The numbers a change would have to beat are named in [What to measure](#what-to-measure).
 
 This is not a Basalt port. Basalt's speed on Blackwell comes from FP4 tensor cores, a discrete VRAM tier and CUDA; none of
 those exist on a Mac. The one idea worth taking is the adaptive expert tier, and Strata already runs it on its CUDA and HIP
@@ -45,7 +47,7 @@ which is why stage 3 is last and default-off.
 4. **Only small Macs are affected.** A pack that fits is never streamed (`ExpertStream::wanted`), so this work only
    touches 16 to 48 GB Macs. On the 128 GB M5 Max it is dead code.
 
-## Stage 1: learn the profile (lowest risk, do it first)
+## Stage 1: learn the profile (lowest risk, do it first) — implemented
 
 The arena's start ordering is what a small Mac lives on. On the 32 GB M4 the arena is 11.5 to 14.7 GB; on this 16 GB
 Air it is about 5 GB, so most experts are always cold and the top of the profile is nearly all that matters. Today that
@@ -68,7 +70,7 @@ ordering is whatever profile shipped, built from someone else's trace.
 
 This is the piece most likely to pay on a 16 GB Air, because it costs one write and no per-window work.
 
-## Stage 2: pick the victim by heat, not by age
+## Stage 2: pick the victim by heat, not by age — implemented
 
 `victim()` walks the size class's LRU tail and takes the first idle, unpinned slot. That is right for a workload that
 never changes and wrong at every topic change: a hot expert that went untouched for a few windows sits near the tail and
@@ -78,7 +80,8 @@ is evicted, then read again on the way back.
   with the oldest winning ties. A full scan is O(slots) on the host turn, which is the wrong place for it.
 - **Hysteresis.** An expert is only worth keeping over the one it replaces when its heat beats it by a margin
   (`adapt-min-gain`'s role on CUDA). Without it, two nearly equal experts swap back and forth and each swap is an SSD
-  read.
+  read. **Not in the branch:** the first cut only chooses among the coldest of the scanned slots, which protects a hot
+  expert without needing the margin. The margin belongs with the rounds, where a swap is optional.
 - **Never touch:** a slot with `state != 0`, a slot with `pin == stamp_` (the GPU is reading it this handshake), a
   retired slot (`retired_`), or a slot inside the prompt region (`region_slots_`).
 
@@ -102,17 +105,18 @@ real outcome and should be measured, not assumed away.
 
 All off unless set, in the style of the other Mac experiments:
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `STRATA_METAL_ADAPT` | 0 | The master switch for stages 2 and 3 |
-| `STRATA_METAL_ADAPT_EVERY` | 1 | Windows between rounds (stage 3) |
-| `STRATA_METAL_ADAPT_SWAPS` | 32 | Pairs a round may move |
-| `STRATA_METAL_ADAPT_DECAY` | 0.85 | Count decay per round; lower follows a topic change sooner |
-| `STRATA_METAL_ADAPT_MIN_GAIN` | 1.0 | The heat margin a newcomer needs over the victim |
-| `STRATA_METAL_ADAPT_SCAN` | 32 | Slots the victim search may look at from the LRU tail |
-| `STRATA_METAL_ADAPT_PROFILE_SAVE` | off | `1` (a path in the data dir), or a full path: write what was learned |
+| Variable | Default | In the branch | Effect |
+| --- | --- | --- | --- |
+| `STRATA_METAL_ADAPT` | 0 | yes | The master switch for stages 2 and 3 |
+| `STRATA_METAL_ADAPT_DECAY` | 0.85 | yes | Count decay per window; lower follows a topic change sooner |
+| `STRATA_METAL_ADAPT_SCAN` | 32 | yes | Slots the victim search may look at from the LRU tail (0: the plain LRU) |
+| `STRATA_METAL_ADAPT_PROFILE_SAVE` | off | yes | `1` (beside the GGUF) or a path: write what was learned at exit, in the STRP format the arena already reads |
+| `STRATA_METAL_ADAPT_EVERY` | 1 | no | Windows between rounds (stage 3) |
+| `STRATA_METAL_ADAPT_SWAPS` | 32 | no | Pairs a round may move (stage 3) |
+| `STRATA_METAL_ADAPT_MIN_GAIN` | 1.0 | no | The heat margin a newcomer needs over the victim (stage 3) |
 
-The numbers are starting points copied from the CUDA defaults and Basalt's page, not values measured here.
+The three unbuilt switches belong to the proactive rounds, which are the stage most likely to lose on a small Mac. The
+decay and scan values are starting points copied from the CUDA defaults and Basalt's page, not values measured here.
 
 ## Where the code goes
 

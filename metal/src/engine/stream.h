@@ -27,6 +27,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace strata::metal_engine {
@@ -92,6 +93,16 @@ private:
     uint8_t* standalone_region(uint64_t bytes);   // the prompt's buffers as their own allocation, when no region of the arena's slots takes them
 
     int fd_ = -1;
+    // the adaptive tier (docs/MAC_ADAPTIVE_TIER.md): decayed routing counts, the eviction choice, and where to save what
+    // was learned. Off unless STRATA_METAL_ADAPT=1; the counts are cheap, but the choice has not been measured on a Mac
+    // yet, so the default path stays the plain LRU.
+    bool adapt_ = false;
+    float adapt_decay_ = 0.85f;
+    int adapt_scan_ = 32;
+    std::string profile_save_;
+    std::vector<float> heat_;                          // NL * NE decayed routing counts
+    std::vector<std::pair<int32_t, int32_t>> prior_;   // the profile this run started from
+    void save_profile();
     // <gguf>.experts (metal/tools/stream_experts.py): each expert's gate, up and down rows together, read with one
     // request (cfd_ >= 0); else the GGUF's three slices.  STRATA_METAL_CONTIG=0: the GGUF always.
     int cfd_ = -1;

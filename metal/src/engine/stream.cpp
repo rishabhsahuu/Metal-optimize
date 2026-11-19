@@ -4,6 +4,9 @@
 
 #include "ref_quant.h"
 #include "arena_budget.h"
+#include "stream_policy.h"
+
+#include "strata/core/expert_cache.hpp"
 
 #include <sys/sysctl.h>
 
@@ -55,7 +58,30 @@ ExpertStream::~ExpertStream() {
     }
     cv_.notify_all();
     for (auto& t : io_) t.join();
+    save_profile();
     if (fd_ >= 0) ::close(fd_);
+}
+
+// --expert-profile-save's idea on the Mac (#477): write what the adaptive tier learned as the STRP profile make_arena
+// reads at the next start. The same core writer the CUDA engine uses, so the file is the same format; a start from it
+// begins with the experts this session ended with, then the hottest of the rest.
+void ExpertStream::save_profile() {
+    if (profile_save_.empty() || heat_.empty()) return;
+    std::vector<uint8_t> resident((size_t) NL * (size_t) ne_, 0);
+    for (int s = 0; s < (int) slots_.size(); ++s) {
+        const Slot& x = slots_[(size_t) s];
+        if (x.layer >= 0 && x.layer < NL && x.e >= 0 && x.e < ne_)
+            resident[(size_t) x.layer * (size_t) ne_ + (size_t) x.e] = 1;
+    }
+    std::vector<double> heat((size_t) NL * (size_t) ne_, 0.0);
+    for (int l = 0; l < NL; ++l)
+        for (int e = 0; e < ne_; ++e) heat[(size_t) l * (size_t) ne_ + (size_t) e] = heat_[(size_t) l * NE + (size_t) e];
+    const auto ranked = strata::core::rank_learned_profile(NL, ne_, resident, heat, prior_);
+    std::string err;
+    if (strata::core::write_expert_profile(profile_save_, NL, ne_, ranked, err))
+        std::fprintf(stderr, "strata metal stream: saved %zu ranked experts to %s\n", ranked.size(), profile_save_.c_str());
+    else
+        std::fprintf(stderr, "strata metal stream: could not save the expert profile: %s\n", err.c_str());
 }
 
 bool ExpertStream::open(const gguf::File& f, std::string& err) {
@@ -63,6 +89,21 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
     if (fd_ < 0) { err = "metal stream: cannot open " + f.path; return false; }
     fcntl(fd_, F_NOCACHE, 1);
     fcntl(fd_, F_RDAHEAD, 0);
+    // The adaptive tier (docs/MAC_ADAPTIVE_TIER.md): counts and a heat-based victim, and a profile saved for the next
+    // start. Off by default: the default path is the plain LRU, so the tokens and the timing are unchanged until a
+    // measurement on a streamed Mac says otherwise.
+    adapt_ = env_int("STRATA_METAL_ADAPT", 0) != 0;
+    if (adapt_) {
+        const char* d = std::getenv("STRATA_METAL_ADAPT_DECAY");
+        if (d && *d) adapt_decay_ = (float) std::atof(d);
+        adapt_scan_ = std::max(0, env_int("STRATA_METAL_ADAPT_SCAN", 32));
+    }
+    if (const char* pf = std::getenv("STRATA_METAL_ADAPT_PROFILE_SAVE"); pf && *pf)
+        profile_save_ = std::string(pf) == "1" ? f.path + ".adaptive-profile.bin" : pf;
+    if (adapt_ || !profile_save_.empty()) heat_.assign((size_t) NL * NE, 0.0f);
+    if (adapt_)
+        std::fprintf(stderr, "strata metal stream: adaptive expert tier on (decay %.2f, scan %d%s)\n", adapt_decay_,
+                     adapt_scan_, profile_save_.empty() ? "" : ", profile saved at exit");
     lay_.resize(NL);
     if (const gguf::Tensor* g0 = f.find("blk.0.ffn_gate_exps.weight"); g0 && g0->shape.size() >= 3 && g0->shape[2] > 0 && g0->shape[2] <= NE)
         ne_ = (int) g0->shape[2];
@@ -258,18 +299,39 @@ void ExpertStream::lru_front(int s) {
 
 int ExpertStream::victim(int ci) {
     Cls& k = cls_[(size_t) ci];
-    for (int s = k.tail; s >= 0; s = slots_[(size_t) s].prev)
-        if (slots_[(size_t) s].state.load() == 0 && slots_[(size_t) s].pin != stamp_) {
-            Slot& x = slots_[(size_t) s];
-            if (x.layer >= 0) {
-                const int key = x.layer * NE + x.e;
-                where_[(size_t) key] = -1;
-                smap_.as<uint32_t>()[key] = 0xFFFFFFFFu;
-            }
-            x.layer = x.e = -1;
-            return s;
+    // the default: the first free slot from the tail, i.e. the least recently used
+    auto usable = [&](int s) {
+        return slots_[(size_t) s].state.load() == 0 && slots_[(size_t) s].pin != stamp_;
+    };
+    // a slot the adaptive choice may take: also not retired after an early-stop fill, and not inside a prompt's region
+    auto usable_adapt = [&](int s) {
+        return usable(s) && !retired_[(size_t) s] &&
+               std::find(region_slots_.begin(), region_slots_.end(), s) == region_slots_.end();
+    };
+    auto evict = [&](int s) {
+        Slot& x = slots_[(size_t) s];
+        if (x.layer >= 0) {
+            const int key = x.layer * NE + x.e;
+            where_[(size_t) key] = -1;
+            smap_.as<uint32_t>()[key] = 0xFFFFFFFFu;
         }
-    return -1;
+        x.layer = x.e = -1;
+        return s;
+    };
+    if (adapt_scan_ <= 0 || heat_.empty()) {
+        for (int s = k.tail; s >= 0; s = slots_[(size_t) s].prev)
+            if (usable(s)) return evict(s);
+        return -1;
+    }
+    // the adaptive tier: the coldest slot within `adapt_scan_` of the tail, so a hot expert a topic change left
+    // untouched is not the first to go. Ties go to the slot nearer the tail (the older one).
+    const int s = policy::coldest(k.tail, adapt_scan_, [&](int i) { return slots_[(size_t) i].prev; }, usable_adapt,
+                                  [&](int i) {
+                                      const Slot& x = slots_[(size_t) i];
+                                      return x.layer < 0 ? -1e30f
+                                                         : heat_[(size_t) x.layer * NE + (size_t) x.e];
+                                  });
+    return s >= 0 ? evict(s) : -1;
 }
 
 // One piece of an expert: slice part / split_ (gate, up, down), piece part % split_ of it.  The pieces of one expert
@@ -398,6 +460,8 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
         std::fprintf(stderr, "strata metal stream: no expert profile at %s: the arena starts layer-interleaved\n", profile.c_str());
     }
     const size_t from_profile = rank.size();
+    if (adapt_ || !profile_save_.empty())
+        prior_.assign(rank.begin(), rank.begin() + (long) from_profile);
     for (int e = 0; e < ne_; ++e)
         for (int l = 0; l < NL; ++l)
             if (!seen[(size_t) l * NE + e]) rank.push_back({l, e});
@@ -640,6 +704,10 @@ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const fl
     std::vector<int> wait;
     {
         std::lock_guard<std::mutex> g(mu_);
+        if (!prompt && (adapt_ || !profile_save_.empty())) {   // one decay a window, then this layer's counts
+            if (l == 0) policy::decay_all(heat_.data(), heat_.size(), adapt_decay_);
+            policy::bump_layer(heat_.data(), NE, l, want, nw);
+        }
         // read-aheads of this layer (or older) that were not started and are not wanted: dropped (the slot goes free)
         {
             std::vector<int> drop;
